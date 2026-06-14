@@ -66,9 +66,9 @@
 
 |Device|GPU|Resolution|MSAA|Texture quality|Frame time|
 |---|---|---|---|---|---|
-|Xiaomi 13T Pro|Immortalis-G715|2712x1220|8x|High (2048x2048)|26ms|
-|Xiaomi 13T Pro|Immortalis-G715|2712x1220|None|High (2048x2048)|16ms|
-|Xiaomi 13T Pro|Immortalis-G715|2712x1220|None|Low (256x256)|**14ms**|
+|Android test device|Immortalis-G715|2712x1220|8x|High (2048x2048)|26ms|
+|Android test device|Immortalis-G715|2712x1220|None|High (2048x2048)|16ms|
+|Android test device|Immortalis-G715|2712x1220|None|Low (256x256)|**14ms**|
 |Google Pixel 7 Pro|Mali-G710|3120x1440|8x|High (2048x2048)|85ms|
 |Google Pixel 7 Pro|Mali-G710|3120x1440|None|High (2048x2048)|62ms|
 |Google Pixel 7 Pro|Mali-G710|3120x1440|None|Low (256x256)|57ms|
