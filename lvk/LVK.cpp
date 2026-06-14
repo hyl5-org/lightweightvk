@@ -86,12 +86,19 @@ static constexpr TextureFormatProperties properties[] = {
     PROPS(RGBA_SRGB8, 4),
     PROPS(BGRA_UN8, 4),
     PROPS(BGRA_SRGB8, 4),
+    PROPS(R11G11B10_F, 4),
     PROPS(A2B10G10R10_UN, 4),
     PROPS(A2R10G10B10_UN, 4),
     PROPS(ETC2_RGB8, 8, .blockWidth = 4, .blockHeight = 4, .compressed = true),
     PROPS(ETC2_SRGB8, 8, .blockWidth = 4, .blockHeight = 4, .compressed = true),
     PROPS(BC7_RGBA, 16, .blockWidth = 4, .blockHeight = 4, .compressed = true),
     PROPS(BC7_SRGBA, 16, .blockWidth = 4, .blockHeight = 4, .compressed = true),
+    PROPS(ASTC_4x4_RGBA, 16, .blockWidth = 4, .blockHeight = 4, .compressed = true),
+    PROPS(ASTC_4x4_SRGBA, 16, .blockWidth = 4, .blockHeight = 4, .compressed = true),
+    PROPS(ASTC_6x6_RGBA, 16, .blockWidth = 6, .blockHeight = 6, .compressed = true),
+    PROPS(ASTC_6x6_SRGBA, 16, .blockWidth = 6, .blockHeight = 6, .compressed = true),
+    PROPS(ASTC_8x8_RGBA, 16, .blockWidth = 8, .blockHeight = 8, .compressed = true),
+    PROPS(ASTC_8x8_SRGBA, 16, .blockWidth = 8, .blockHeight = 8, .compressed = true),
     PROPS(Z_UN16, 2, .depth = true),
     PROPS(Z_UN24, 3, .depth = true),
     PROPS(Z_F32, 4, .depth = true),
@@ -293,6 +300,10 @@ void lvk::logShaderSource(const char* text) {
 }
 
 uint32_t lvk::VertexInput::getVertexSize() const {
+  if (inputBindings[0].stride) {
+    return inputBindings[0].stride;
+  }
+
   uint32_t vertexSize = 0;
   for (uint32_t i = 0; i < LVK_VERTEX_ATTRIBUTES_MAX && attributes[i].format != VertexFormat_Invalid; i++) {
     LVK_ASSERT_MSG(attributes[i].offset == vertexSize, "Unsupported vertex attributes format");

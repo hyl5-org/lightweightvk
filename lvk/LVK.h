@@ -79,6 +79,42 @@
 
 #define LVK_ARRAY_NUM_ELEMENTS(x) (sizeof(x) / sizeof((x)[0]))
 
+#if !defined(LVK_DO_PRAGMA)
+  #if defined(_MSC_VER)
+    #define LVK_DO_PRAGMA(x) __pragma(x)
+  #else
+    #define LVK_DO_PRAGMA(x) _Pragma(#x)
+  #endif
+#endif
+
+// Use around specific slow-to-debug functions in optimized builds, e.g.
+// PRAGMA_DISABLE_OPTIMIZATION
+// void someFunction() { ... }
+// PRAGMA_ENABLE_OPTIMIZATION
+#if defined(_MSC_VER)
+  #define LVK_PRAGMA_DISABLE_OPTIMIZATION LVK_DO_PRAGMA(optimize("", off))
+  #define LVK_PRAGMA_ENABLE_OPTIMIZATION LVK_DO_PRAGMA(optimize("", on))
+#elif defined(__clang__)
+  #define LVK_PRAGMA_DISABLE_OPTIMIZATION LVK_DO_PRAGMA(clang optimize off)
+  #define LVK_PRAGMA_ENABLE_OPTIMIZATION LVK_DO_PRAGMA(clang optimize on)
+#elif defined(__GNUC__)
+  #define LVK_PRAGMA_DISABLE_OPTIMIZATION \
+    LVK_DO_PRAGMA(GCC push_options)       \
+    LVK_DO_PRAGMA(GCC optimize("O0"))
+  #define LVK_PRAGMA_ENABLE_OPTIMIZATION LVK_DO_PRAGMA(GCC pop_options)
+#else
+  #define LVK_PRAGMA_DISABLE_OPTIMIZATION
+  #define LVK_PRAGMA_ENABLE_OPTIMIZATION
+#endif
+
+#if !defined(PRAGMA_DISABLE_OPTIMIZATION)
+  #define PRAGMA_DISABLE_OPTIMIZATION LVK_PRAGMA_DISABLE_OPTIMIZATION
+#endif
+
+#if !defined(PRAGMA_ENABLE_OPTIMIZATION)
+  #define PRAGMA_ENABLE_OPTIMIZATION LVK_PRAGMA_ENABLE_OPTIMIZATION
+#endif
+
 namespace lvk {
 
 class IContext;
@@ -365,6 +401,9 @@ struct Dimensions {
   inline Dimensions divide3D(uint32_t v) const {
     return {.width = width / v, .height = height / v, .depth = depth / v};
   }
+  inline Dimensions divide2DRoundUp(uint32_t v) const {
+    return {.width = (width + v - 1)/ v, .height = (height + v - 1)/ v, .depth = depth};
+  }
   inline bool operator==(const Dimensions& other) const {
     return width == other.width && height == other.height && depth == other.depth;
   }
@@ -522,6 +561,7 @@ enum VertexFormat : uint8_t {
   VertexFormat_HalfFloat4,
 
   VertexFormat_Int_2_10_10_10_REV,
+  VertexFormat_A2B10G10R10_SNorm = VertexFormat_Int_2_10_10_10_REV,
 };
 
 enum VertexInputRate : uint8_t {
@@ -555,6 +595,7 @@ enum Format : uint8_t {
   Format_BGRA_UN8,
   Format_BGRA_SRGB8,
 
+  Format_R11G11B10_F,
   Format_A2B10G10R10_UN,
   Format_A2R10G10B10_UN,
 
@@ -562,7 +603,12 @@ enum Format : uint8_t {
   Format_ETC2_SRGB8,
   Format_BC7_RGBA,
   Format_BC7_SRGBA,
-
+  Format_ASTC_4x4_RGBA,
+  Format_ASTC_4x4_SRGBA,
+  Format_ASTC_6x6_RGBA,
+  Format_ASTC_6x6_SRGBA,
+  Format_ASTC_8x8_RGBA,
+  Format_ASTC_8x8_SRGBA,
   Format_Z_UN16,
   Format_Z_UN24,
   Format_Z_F32,
@@ -1195,6 +1241,7 @@ class IContext {
                                                                 Result* outResult = nullptr) = 0;
 
   [[nodiscard]] virtual Holder<AccelStructHandle> createAccelerationStructure(const AccelStructDesc& desc, Result* outResult = nullptr) = 0;
+  virtual void createBLASBatch(const AccelStructDesc* descs, AccelStructHandle* outHandles, uint32_t count, Result* outResult = nullptr) = 0;
 
   virtual void destroy(ComputePipelineHandle handle) = 0;
   virtual void destroy(RenderPipelineHandle handle) = 0;
@@ -1211,6 +1258,7 @@ class IContext {
 
 #pragma region Acceleration structure functions
   [[nodiscard]] virtual AccelStructSizes getAccelStructSizes(const AccelStructDesc& desc, Result* outResult = nullptr) const = 0;
+  [[nodiscard]] virtual uint64_t getAccelStructMemorySize(AccelStructHandle handle) const = 0;
 #pragma endregion
 
 #pragma region Buffer functions
@@ -1282,6 +1330,7 @@ struct ContextConfig {
   VulkanVersion vulkanVersion = VulkanVersion_1_3;
   bool terminateOnValidationError = false; // invoke std::terminate() on any validation error
   bool enableValidation = true;
+  bool enableValidationBestPractices = false;
   lvk::ColorSpace swapchainRequestedColorSpace = lvk::ColorSpace_SRGB_NONLINEAR;
   // owned by the application - should be alive until createVulkanContextWithSwapchain() returns
   const void* pipelineCacheData = nullptr;

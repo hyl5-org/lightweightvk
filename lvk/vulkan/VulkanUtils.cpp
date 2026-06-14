@@ -240,6 +240,8 @@ VkFormat lvk::formatToVkFormat(lvk::Format format) {
     return VK_FORMAT_R32G32B32A32_UINT;
   case lvk::Format_RGBA_F32:
     return VK_FORMAT_R32G32B32A32_SFLOAT;
+  case lvk::Format_R11G11B10_F:
+    return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
   case lvk::Format_A2B10G10R10_UN:
     return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
   case lvk::Format_A2R10G10B10_UN:
@@ -252,6 +254,18 @@ VkFormat lvk::formatToVkFormat(lvk::Format format) {
     return VK_FORMAT_BC7_UNORM_BLOCK;
   case lvk::Format_BC7_SRGBA:
     return VK_FORMAT_BC7_SRGB_BLOCK;
+  case lvk::Format_ASTC_4x4_RGBA:
+    return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+  case lvk::Format_ASTC_4x4_SRGBA:
+    return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+  case lvk::Format_ASTC_6x6_RGBA:
+    return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+  case lvk::Format_ASTC_6x6_SRGBA:
+    return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+  case lvk::Format_ASTC_8x8_RGBA:
+    return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+  case lvk::Format_ASTC_8x8_SRGBA:
+    return VK_FORMAT_ASTC_8x8_SRGB_BLOCK;
   case lvk::Format_Z_UN16:
     return VK_FORMAT_D16_UNORM;
   case lvk::Format_Z_UN24:
@@ -327,6 +341,8 @@ lvk::Format lvk::vkFormatToFormat(VkFormat format) {
     return Format_RGBA_UI32;
   case VK_FORMAT_R32G32B32A32_SFLOAT:
     return Format_RGBA_F32;
+  case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    return Format_R11G11B10_F;
   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     return Format_A2B10G10R10_UN;
   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
@@ -341,6 +357,18 @@ lvk::Format lvk::vkFormatToFormat(VkFormat format) {
     return Format_BC7_RGBA;
   case VK_FORMAT_BC7_SRGB_BLOCK:
     return Format_BC7_SRGBA;
+  case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
+    return Format_ASTC_4x4_RGBA;
+  case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
+    return Format_ASTC_4x4_SRGBA;
+  case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
+    return Format_ASTC_6x6_RGBA;
+  case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
+    return Format_ASTC_6x6_SRGBA;
+  case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
+    return Format_ASTC_8x8_RGBA;
+  case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
+    return Format_ASTC_8x8_SRGBA;
   case VK_FORMAT_X8_D24_UNORM_PACK32:
     return Format_Z_UN24;
   case VK_FORMAT_D24_UNORM_S8_UINT:
@@ -799,13 +827,20 @@ lvk::Result lvk::compileShaderGlslang(lvk::ShaderStage stage,
     return Result(Result::Code::RuntimeError, "glslang_program_link() failed");
   }
 
+  const bool debugShaders =
+#if defined(NDEBUG)
+      false;
+#else
+      true;
+#endif
+
   glslang_spv_options_t options = {
-      .generate_debug_info = true,
-      .strip_debug_info = false,
+      .generate_debug_info = debugShaders,
+      .strip_debug_info = !debugShaders,
       .disable_optimizer = false,
-      .optimize_size = true,
+      .optimize_size = false,
       .disassemble = false,
-      .validate = true,
+      .validate = debugShaders,
       .emit_nonsemantic_shader_debug_info = false,
       .emit_nonsemantic_shader_debug_source = false,
   };
@@ -1156,9 +1191,11 @@ uint32_t lvk::getBytesPerPixel(VkFormat format) {
   case VK_FORMAT_R8G8B8A8_UNORM:
   case VK_FORMAT_B8G8R8A8_UNORM:
   case VK_FORMAT_R8G8B8A8_SRGB:
+  case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
   case VK_FORMAT_R16G16_SFLOAT:
   case VK_FORMAT_R32_SFLOAT:
   case VK_FORMAT_R32_UINT:
+  case VK_FORMAT_D32_SFLOAT:
     return 4;
   case VK_FORMAT_R16G16B16_SFLOAT:
     return 6;

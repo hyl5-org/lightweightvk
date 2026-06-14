@@ -161,6 +161,7 @@ class VulkanSwapchain final {
   };
   TextureHandle swapchainTextures_[LVK_MAX_SWAPCHAIN_IMAGES] = {};
   VkSemaphore acquireSemaphore_[LVK_MAX_SWAPCHAIN_IMAGES] = {};
+  VkSemaphore presentSemaphore_[LVK_MAX_SWAPCHAIN_IMAGES] = {};
   VkFence presentFence_[LVK_MAX_SWAPCHAIN_IMAGES] = {};
   VkFence acquireFence_[LVK_MAX_SWAPCHAIN_IMAGES] = {}; // remove once VK_EXT_swapchain_maintenance1 becomes mandatory
   uint64_t timelineWaitValues_[LVK_MAX_SWAPCHAIN_IMAGES] = {};
@@ -216,8 +217,8 @@ class VulkanImmediateCommands final {
                                                 .stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
   VkSemaphoreSubmitInfo waitSemaphore_ = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                           .stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT}; // extra "wait" semaphore
-  VkSemaphoreSubmitInfo signalSemaphore_ = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                            .stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT}; // extra "signal" semaphore
+  VkSemaphoreSubmitInfo signalSemaphores_[2] = {}; // extra "signal" semaphores
+  uint32_t numSignalSemaphores_ = 0;
   uint32_t numAvailableCommandBuffers_ = kMaxCommandBuffers;
   uint32_t submitCounter_ = 1;
 };
@@ -563,6 +564,7 @@ class VulkanContext final : public IContext {
   Holder<QueryPoolHandle> createQueryPool(uint32_t numQueries, const char* debugName, Result* outResult) override;
 
   Holder<AccelStructHandle> createAccelerationStructure(const AccelStructDesc& desc, Result* outResult) override;
+  void createBLASBatch(const AccelStructDesc* descs, AccelStructHandle* outHandles, uint32_t count, Result* outResult) override;
 
   void destroy(ComputePipelineHandle handle) override;
   void destroy(RenderPipelineHandle handle) override;
@@ -576,6 +578,7 @@ class VulkanContext final : public IContext {
   void destroy(Framebuffer& fb) override;
 
   uint64_t gpuAddress(AccelStructHandle handle) const override;
+  uint64_t getAccelStructMemorySize(AccelStructHandle handle) const override;
 
   Result upload(BufferHandle handle, const void* data, size_t size, size_t offset) override;
   Result download(BufferHandle handle, void* data, size_t size, size_t offset) override;
@@ -813,6 +816,7 @@ class VulkanContext final : public IContext {
   lvk::Pool<lvk::Texture, lvk::VulkanImage> texturesPool_;
   lvk::Pool<lvk::QueryPool, VkQueryPool> queriesPool_;
   lvk::Pool<lvk::AccelerationStructure, lvk::AccelerationStructure> accelStructuresPool_;
+  uint32_t tLasCount = 0;
 };
 
 } // namespace lvk

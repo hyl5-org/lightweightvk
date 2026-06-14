@@ -70,6 +70,8 @@ enum Bindings {
 
 const uint32_t kDescriptorSet_InputAttachments = 4; // for VkDescriptorSetLayout in getVkPipeline()
 
+const uint32_t pc_aligned_size = 16;
+
 VkDeviceSize getAlignedSize(uint64_t value, uint64_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
@@ -161,7 +163,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL vulkanDebugCallback(VkDebugUtilsMessageSeverityFl
                      messageID,
                      message);
   } else {
-    MINILOG_LOG_PROC(level, "%sValidation layer:\n%s\n", isError ? "\nERROR:\n" : "", cbData->pMessage);
+    MINILOG_LOG_PROC(level, "%sValidation layer:\n%s\n", isError ? "\nERROR:\n" : "\nWARNING|LOG|...", cbData->pMessage);
   }
 
   if (isError) {
@@ -1321,6 +1323,7 @@ lvk::VulkanSwapchain::VulkanSwapchain(VulkanContext& ctx, uint32_t width, uint32
   // create images, image views and framebuffers
   for (uint32_t i = 0; i < numSwapchainImages_; i++) {
     acquireSemaphore_[i] = lvk::createSemaphore(device_, "Semaphore: swapchain-acquire");
+    presentSemaphore_[i] = lvk::createSemaphore(device_, "Semaphore: swapchain-present");
 
     if (!ctx_.has_KHR_swapchain_maintenance1_) {
       char debugNameFence[256] = {0};
@@ -1368,6 +1371,9 @@ lvk::VulkanSwapchain::~VulkanSwapchain() {
   for (VkSemaphore sem : acquireSemaphore_) {
     vkDestroySemaphore(device_, sem, nullptr);
   }
+  for (VkSemaphore sem : presentSemaphore_) {
+    vkDestroySemaphore(device_, sem, nullptr);
+  }
   for (VkFence fence : presentFence_) {
     if (fence)
       vkDestroyFence(device_, fence, nullptr);
@@ -1404,19 +1410,25 @@ lvk::TextureHandle lvk::VulkanSwapchain::getCurrentTexture() {
         .pSemaphores = &ctx_.timelineSemaphore_,
         .pValues = &timelineWaitValues_[currentImageIndex_],
     };
+    LVK_PROFILER_ZONE("Wait GPU before swapchain acquire", LVK_PROFILER_COLOR_PRESENT);
     VK_ASSERT(vkWaitSemaphores(device_, &waitInfo, UINT64_MAX));
+    LVK_PROFILER_ZONE_END();
 
     VkFence acquireFence = VK_NULL_HANDLE;
 
     if (ctx_.has_KHR_swapchain_maintenance1_) {
       // VK_KHR_swapchain_maintenance1: before acquiring again, wait for the presentation operation to finish
       if (presentFence_[currentImageIndex_]) {
+        LVK_PROFILER_ZONE("Wait backbuffer present fence", LVK_PROFILER_COLOR_PRESENT);
         VK_ASSERT(vkWaitForFences(device_, 1, &presentFence_[currentImageIndex_], VK_TRUE, UINT64_MAX));
+        LVK_PROFILER_ZONE_END();
         VK_ASSERT(vkResetFences(device_, 1, &presentFence_[currentImageIndex_]));
       }
     } else {
       // without VK_KHR_swapchain_maintenance1: use acquire fences to synchronize semaphore reuse
+      LVK_PROFILER_ZONE("Wait backbuffer acquire fence", LVK_PROFILER_COLOR_PRESENT);
       VK_ASSERT(vkWaitForFences(device_, 1, &acquireFence_[currentImageIndex_], VK_TRUE, UINT64_MAX));
+      LVK_PROFILER_ZONE_END();
       VK_ASSERT(vkResetFences(device_, 1, &acquireFence_[currentImageIndex_]));
 
       acquireFence = acquireFence_[currentImageIndex_];
@@ -1424,7 +1436,10 @@ lvk::TextureHandle lvk::VulkanSwapchain::getCurrentTexture() {
 
     VkSemaphore acquireSemaphore = acquireSemaphore_[currentImageIndex_];
     // when timeout is set to UINT64_MAX, we wait until the next image has been acquired
-    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquireSemaphore, acquireFence, &currentImageIndex_);
+    VkResult r = VK_SUCCESS;
+    LVK_PROFILER_ZONE("Wait backbuffer vkAcquireNextImageKHR", LVK_PROFILER_COLOR_PRESENT);
+    r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquireSemaphore, acquireFence, &currentImageIndex_);
+    LVK_PROFILER_ZONE_END();
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR) {
       VK_ASSERT(r);
     }
@@ -1589,7 +1604,7 @@ const lvk::VulkanImmediateCommands::CommandBufferWrapper& lvk::VulkanImmediateCo
   }
 
   while (!numAvailableCommandBuffers_) {
-    LLOGL("Waiting for command buffers...\n");
+    LLOGP("Waiting for command buffers...\n");
     LVK_PROFILER_ZONE("Waiting for command buffers...", LVK_PROFILER_COLOR_WAIT);
     purge();
     LVK_PROFILER_ZONE_END();
@@ -1711,15 +1726,16 @@ lvk::SubmitHandle lvk::VulkanImmediateCommands::submit(const CommandBufferWrappe
   if (lastSubmitSemaphore_.semaphore) {
     waitSemaphores[numWaitSemaphores++] = lastSubmitSemaphore_;
   }
-  VkSemaphoreSubmitInfo signalSemaphores[] = {
+  VkSemaphoreSubmitInfo signalSemaphores[3] = {
       VkSemaphoreSubmitInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                             .semaphore = wrapper.semaphore_,
                             .stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT},
       {},
+      {},
   };
   uint32_t numSignalSemaphores = 1;
-  if (signalSemaphore_.semaphore) {
-    signalSemaphores[numSignalSemaphores++] = signalSemaphore_;
+  for (uint32_t i = 0; i != numSignalSemaphores_; i++) {
+    signalSemaphores[numSignalSemaphores++] = signalSemaphores_[i];
   }
 
   LVK_PROFILER_ZONE("vkQueueSubmit2()", LVK_PROFILER_COLOR_SUBMIT);
@@ -1814,7 +1830,10 @@ lvk::SubmitHandle lvk::VulkanImmediateCommands::submit(const CommandBufferWrappe
   lastSubmitSemaphore_.semaphore = wrapper.semaphore_;
   lastSubmitHandle_ = wrapper.handle_;
   waitSemaphore_.semaphore = VK_NULL_HANDLE;
-  signalSemaphore_.semaphore = VK_NULL_HANDLE;
+  for (VkSemaphoreSubmitInfo& semaphore : signalSemaphores_) {
+    semaphore = {};
+  }
+  numSignalSemaphores_ = 0;
 
   // reset
   const_cast<CommandBufferWrapper&>(wrapper).isEncoding_ = false;
@@ -1835,10 +1854,14 @@ void lvk::VulkanImmediateCommands::waitSemaphore(VkSemaphore semaphore) {
 }
 
 void lvk::VulkanImmediateCommands::signalSemaphore(VkSemaphore semaphore, uint64_t signalValue) {
-  LVK_ASSERT(signalSemaphore_.semaphore == VK_NULL_HANDLE);
+  LVK_ASSERT(numSignalSemaphores_ < LVK_ARRAY_NUM_ELEMENTS(signalSemaphores_));
 
-  signalSemaphore_.semaphore = semaphore;
-  signalSemaphore_.value = signalValue;
+  signalSemaphores_[numSignalSemaphores_++] = VkSemaphoreSubmitInfo{
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+      .semaphore = semaphore,
+      .value = signalValue,
+      .stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+  };
 }
 
 VkSemaphore lvk::VulkanImmediateCommands::acquireLastSubmitSemaphore() {
@@ -2125,7 +2148,7 @@ VkResult lvk::VulkanPipelineBuilder::build(VkDevice device,
   };
 
 #if defined(ANDROID)
-  LLOGD("vkCreateGraphicsPipelines(): %s\n", debugName);
+  LLOGP("vkCreateGraphicsPipelines(): %s\n", debugName);
 #endif // defined(ANDROID)
   const VkResult result = vkCreateGraphicsPipelines(device, pipelineCache, 1, &ci, nullptr, outPipeline);
 
@@ -2372,6 +2395,10 @@ void lvk::CommandBuffer::cmdBeginRendering(const lvk::RenderPass& renderPass, co
   viewMask_ = renderPass.viewMask;
 
   for (size_t i = 0; i != deps.textures.size(); i++) {
+	  if (!deps.textures[i].valid())
+	  {
+      continue;
+		}
     transitionToShaderReadOnly(deps.textures[i]);
   }
   for (size_t i = 0; i != deps.buffers.size(); i++) {
@@ -2766,6 +2793,9 @@ void lvk::CommandBuffer::cmdFillBuffer(BufferHandle buffer, size_t bufferOffset,
 
   VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
 
+  // if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+  //   dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  // }
   if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) {
     dstStage |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
   }
@@ -2851,6 +2881,9 @@ void lvk::CommandBuffer::cmdUpdateBuffer(BufferHandle buffer, size_t bufferOffse
 
   VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
 
+  // if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+  //   dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  // }
   if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) {
     dstStage |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
   }
@@ -4084,12 +4117,13 @@ lvk::SubmitHandle lvk::VulkanContext::submit(lvk::ICommandBuffer& commandBuffer,
     // we wait for this value next time we want to acquire this swapchain image
     swapchain_->timelineWaitValues_[swapchain_->currentImageIndex_] = signalValue;
     immediate_->signalSemaphore(timelineSemaphore_, signalValue);
+    immediate_->signalSemaphore(swapchain_->presentSemaphore_[swapchain_->currentImageIndex_], 0);
   }
 
   vkCmdBuffer->lastSubmitHandle_ = immediate_->submit(*vkCmdBuffer->wrapper_);
 
   if (shouldPresent) {
-    swapchain_->present(immediate_->acquireLastSubmitSemaphore());
+    swapchain_->present(swapchain_->presentSemaphore_[swapchain_->currentImageIndex_]);
   }
 
   processDeferredTasks();
@@ -4717,10 +4751,12 @@ lvk::Holder<lvk::TextureHandle> lvk::VulkanContext::createTextureView(lvk::Textu
   return {this, handle};
 }
 
+
 lvk::AccelStructHandle lvk::VulkanContext::createBLAS(const AccelStructDesc& desc, Result* outResult) {
   VkAccelerationStructureGeometryKHR accelerationStructureGeometry{};
   VkAccelerationStructureBuildSizesInfoKHR accelerationStructureBuildSizesInfo{};
   getBuildInfoBLAS(desc, accelerationStructureGeometry, accelerationStructureBuildSizesInfo);
+  const bool allowCompaction = (desc.buildFlags & lvk::AccelStructBuildFlagBits_AllowCompaction) != 0;
 
   char debugNameBuffer[256] = {0};
   if (desc.debugName) {
@@ -4781,6 +4817,90 @@ lvk::AccelStructHandle lvk::VulkanContext::createBLAS(const AccelStructDesc& des
       lvk::getVkCommandBuffer(buffer), 1, &accelerationBuildGeometryInfo, accelerationBuildStructureRangeInfos);
   wait(submit(buffer, {}));
 
+  if (allowCompaction) {
+    VkQueryPool compactionQueryPool = VK_NULL_HANDLE;
+    const VkQueryPoolCreateInfo createInfo = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+        .queryCount = 1,
+    };
+    VK_ASSERT(vkCreateQueryPool(vkDevice_, &createInfo, nullptr, &compactionQueryPool));
+
+    lvk::ICommandBuffer& queryBuffer = acquireCommandBuffer();
+    vkCmdResetQueryPool(lvk::getVkCommandBuffer(queryBuffer), compactionQueryPool, 0, 1);
+    vkCmdWriteAccelerationStructuresPropertiesKHR(lvk::getVkCommandBuffer(queryBuffer),
+                                                  1,
+                                                  &accelStruct.vkHandle,
+                                                  VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                                                  compactionQueryPool,
+                                                  0);
+    wait(submit(queryBuffer, {}));
+
+    VkDeviceSize compactedSize = 0;
+    VK_ASSERT(vkGetQueryPoolResults(vkDevice_,
+                                    compactionQueryPool,
+                                    0,
+                                    1,
+                                    sizeof(compactedSize),
+                                    &compactedSize,
+                                    sizeof(compactedSize),
+                                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT));
+
+    const bool compactedSizeIsSane = compactedSize >= 4096 &&
+                                     compactedSize * 32 >= accelerationStructureBuildSizesInfo.accelerationStructureSize;
+    if (compactedSize > 0 && compactedSize < accelerationStructureBuildSizesInfo.accelerationStructureSize && compactedSizeIsSane) {
+      char compactedDebugNameBuffer[256] = {0};
+      if (desc.debugName) {
+        snprintf(compactedDebugNameBuffer, sizeof(compactedDebugNameBuffer) - 1, "Buffer: %s compacted", desc.debugName);
+      }
+      lvk::AccelerationStructure compactedAccelStruct = {
+          .buildRangeInfo = accelStruct.buildRangeInfo,
+          .buffer = createBuffer(
+              {
+                  .usage = lvk::BufferUsageBits_AccelStructStorage,
+                  .storage = lvk::StorageType_Device,
+                  .size = compactedSize,
+                  .debugName = compactedDebugNameBuffer,
+              },
+              nullptr,
+              outResult),
+      };
+      const VkAccelerationStructureCreateInfoKHR compactedCI = {
+          .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+          .buffer = getVkBuffer(this, compactedAccelStruct.buffer),
+          .size = compactedSize,
+          .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+      };
+      VK_ASSERT(vkCreateAccelerationStructureKHR(vkDevice_, &compactedCI, nullptr, &compactedAccelStruct.vkHandle));
+
+      const VkCopyAccelerationStructureInfoKHR copyInfo = {
+          .sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR,
+          .src = accelStruct.vkHandle,
+          .dst = compactedAccelStruct.vkHandle,
+          .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR,
+      };
+      lvk::ICommandBuffer& copyBuffer = acquireCommandBuffer();
+      vkCmdCopyAccelerationStructureKHR(lvk::getVkCommandBuffer(copyBuffer), &copyInfo);
+      wait(submit(copyBuffer, {}));
+
+      vkDestroyAccelerationStructureKHR(vkDevice_, accelStruct.vkHandle, nullptr);
+      accelStruct = std::move(compactedAccelStruct);
+      // LLOGL("BLAS compacted: %llu -> %llu bytes\n",
+      //       (unsigned long long)accelerationStructureBuildSizesInfo.accelerationStructureSize,
+      //       (unsigned long long)compactedSize);
+    } else if (compactedSize > 0 && compactedSize < accelerationStructureBuildSizesInfo.accelerationStructureSize) {
+      LLOGW("BLAS compaction query returned suspicious size, skipped: build=%llu compacted=%llu bytes\n",
+            (unsigned long long)accelerationStructureBuildSizesInfo.accelerationStructureSize,
+            (unsigned long long)compactedSize);
+    } else {
+      LLOGL("BLAS compaction skipped: build=%llu compacted=%llu bytes\n",
+            (unsigned long long)accelerationStructureBuildSizesInfo.accelerationStructureSize,
+            (unsigned long long)compactedSize);
+    }
+
+    vkDestroyQueryPool(vkDevice_, compactionQueryPool, nullptr);
+  }
+
   const VkAccelerationStructureDeviceAddressInfoKHR accelerationDeviceAddressInfo{
       .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
       .accelerationStructure = accelStruct.vkHandle,
@@ -4788,6 +4908,240 @@ lvk::AccelStructHandle lvk::VulkanContext::createBLAS(const AccelStructDesc& des
   accelStruct.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vkDevice_, &accelerationDeviceAddressInfo);
 
   return accelStructuresPool_.create(std::move(accelStruct));
+}
+
+void lvk::VulkanContext::createBLASBatch(const AccelStructDesc* descs, AccelStructHandle* outHandles, uint32_t count, Result* outResult) {
+  LVK_PROFILER_FUNCTION();
+
+  if (!count) {
+    Result::setResult(outResult, Result());
+    return;
+  }
+
+  if (!LVK_VERIFY(has_KHR_acceleration_structure_)) {
+    Result::setResult(outResult, Result(Result::Code::RuntimeError, "VK_KHR_acceleration_structure is not enabled"));
+    return;
+  }
+
+  const uint32_t alignment = accelerationStructureProperties_.minAccelerationStructureScratchOffsetAlignment;
+
+  struct BLASBuildEntry {
+    VkAccelerationStructureGeometryKHR geometry = {};
+    VkAccelerationStructureBuildSizesInfoKHR sizesInfo = {};
+    lvk::AccelerationStructure accelStruct = {};
+    bool allowCompaction = false;
+  };
+
+  std::vector<BLASBuildEntry> entries(count);
+  uint64_t maxScratchSize = 0;
+
+  for (uint32_t i = 0; i < count; i++) {
+    LVK_ASSERT(descs[i].type == AccelStructType_BLAS);
+    outHandles[i] = {};
+
+    getBuildInfoBLAS(descs[i], entries[i].geometry, entries[i].sizesInfo);
+    entries[i].allowCompaction = (descs[i].buildFlags & AccelStructBuildFlagBits_AllowCompaction) != 0;
+
+    if (entries[i].sizesInfo.buildScratchSize > maxScratchSize) {
+      maxScratchSize = entries[i].sizesInfo.buildScratchSize;
+    }
+
+    char debugNameBuffer[256] = {0};
+    if (descs[i].debugName) {
+      snprintf(debugNameBuffer, sizeof(debugNameBuffer) - 1, "Buffer: %s", descs[i].debugName);
+    }
+    entries[i].accelStruct.buildRangeInfo = {
+        .primitiveCount = descs[i].buildRange.primitiveCount,
+        .primitiveOffset = descs[i].buildRange.primitiveOffset,
+        .firstVertex = descs[i].buildRange.firstVertex,
+        .transformOffset = descs[i].buildRange.transformOffset,
+    };
+    entries[i].accelStruct.buffer = createBuffer(
+        {
+            .usage = lvk::BufferUsageBits_AccelStructStorage,
+            .storage = lvk::StorageType_Device,
+            .size = entries[i].sizesInfo.accelerationStructureSize,
+            .debugName = debugNameBuffer,
+        },
+        nullptr,
+        outResult);
+
+    const VkAccelerationStructureCreateInfoKHR ciAS = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+        .buffer = getVkBuffer(this, entries[i].accelStruct.buffer),
+        .size = entries[i].sizesInfo.accelerationStructureSize,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+    };
+    VK_ASSERT(vkCreateAccelerationStructureKHR(vkDevice_, &ciAS, nullptr, &entries[i].accelStruct.vkHandle));
+  }
+
+  lvk::Holder<lvk::BufferHandle> scratchBuffer = createBuffer(
+      {
+          .usage = lvk::BufferUsageBits_Storage,
+          .storage = lvk::StorageType_Device,
+          .size = maxScratchSize,
+          .debugName = "Buffer: BLAS batch scratch",
+      },
+      nullptr,
+      outResult);
+
+  const uint64_t scratchAddress = getAlignedAddress(gpuAddress(scratchBuffer), alignment);
+
+  // Build all BLAS in one command buffer
+  {
+    lvk::ICommandBuffer& cmdBuf = acquireCommandBuffer();
+    const VkCommandBuffer vkCmdBuf = lvk::getVkCommandBuffer(cmdBuf);
+
+    for (uint32_t i = 0; i < count; i++) {
+      if (i > 0) {
+        // Barrier between builds: scratch buffer WAW hazard
+        const VkMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+            .dstStageMask = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        };
+        const VkDependencyInfo depInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(vkCmdBuf, &depInfo);
+      }
+
+      const VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
+          .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+          .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+          .flags = buildFlagsToVkBuildAccelerationStructureFlags(descs[i].buildFlags),
+          .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+          .dstAccelerationStructure = entries[i].accelStruct.vkHandle,
+          .geometryCount = 1,
+          .pGeometries = &entries[i].geometry,
+          .scratchData = {.deviceAddress = scratchAddress},
+      };
+
+      const VkAccelerationStructureBuildRangeInfoKHR* rangeInfos[] = {&entries[i].accelStruct.buildRangeInfo};
+      vkCmdBuildAccelerationStructuresKHR(vkCmdBuf, 1, &buildInfo, rangeInfos);
+    }
+
+    wait(submit(cmdBuf, {}));
+  }
+
+  // Batch compaction
+  uint32_t numCompactable = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    if (entries[i].allowCompaction) {
+      numCompactable++;
+    }
+  }
+
+  if (numCompactable > 0) {
+    VkQueryPool compactionQueryPool = VK_NULL_HANDLE;
+    const VkQueryPoolCreateInfo qpCI = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+        .queryCount = numCompactable,
+    };
+    VK_ASSERT(vkCreateQueryPool(vkDevice_, &qpCI, nullptr, &compactionQueryPool));
+
+    // Query compacted sizes
+    {
+      lvk::ICommandBuffer& cmdBuf = acquireCommandBuffer();
+      const VkCommandBuffer vkCmdBuf = lvk::getVkCommandBuffer(cmdBuf);
+      vkCmdResetQueryPool(vkCmdBuf, compactionQueryPool, 0, numCompactable);
+
+      uint32_t queryIndex = 0;
+      for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].allowCompaction) {
+          vkCmdWriteAccelerationStructuresPropertiesKHR(
+              vkCmdBuf, 1, &entries[i].accelStruct.vkHandle,
+              VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, compactionQueryPool, queryIndex++);
+        }
+      }
+      wait(submit(cmdBuf, {}));
+    }
+
+    std::vector<VkDeviceSize> compactedSizes(numCompactable);
+    VK_ASSERT(vkGetQueryPoolResults(
+        vkDevice_, compactionQueryPool, 0, numCompactable,
+        sizeof(VkDeviceSize) * numCompactable, compactedSizes.data(), sizeof(VkDeviceSize),
+        VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT));
+
+    // Compact eligible BLAS
+    {
+      std::vector<std::pair<uint32_t, VkAccelerationStructureKHR>> pendingDestroy;
+      lvk::ICommandBuffer& cmdBuf = acquireCommandBuffer();
+      const VkCommandBuffer vkCmdBuf = lvk::getVkCommandBuffer(cmdBuf);
+
+      uint32_t queryIndex = 0;
+      for (uint32_t i = 0; i < count; i++) {
+        if (!entries[i].allowCompaction) {
+          continue;
+        }
+        const VkDeviceSize compactedSize = compactedSizes[queryIndex++];
+        const VkDeviceSize originalSize = entries[i].sizesInfo.accelerationStructureSize;
+        const bool sizeIsSane = compactedSize >= 4096 && compactedSize * 32 >= originalSize;
+
+        if (compactedSize > 0 && compactedSize < originalSize && sizeIsSane) {
+          char compactedDebugName[256] = {0};
+          if (descs[i].debugName) {
+            snprintf(compactedDebugName, sizeof(compactedDebugName) - 1, "Buffer: %s compacted", descs[i].debugName);
+          }
+          lvk::AccelerationStructure compactedAS = {
+              .buildRangeInfo = entries[i].accelStruct.buildRangeInfo,
+              .buffer = createBuffer(
+                  {
+                      .usage = lvk::BufferUsageBits_AccelStructStorage,
+                      .storage = lvk::StorageType_Device,
+                      .size = compactedSize,
+                      .debugName = compactedDebugName,
+                  },
+                  nullptr,
+                  outResult),
+          };
+          const VkAccelerationStructureCreateInfoKHR compactedCI = {
+              .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+              .buffer = getVkBuffer(this, compactedAS.buffer),
+              .size = compactedSize,
+              .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+          };
+          VK_ASSERT(vkCreateAccelerationStructureKHR(vkDevice_, &compactedCI, nullptr, &compactedAS.vkHandle));
+
+          const VkCopyAccelerationStructureInfoKHR copyInfo = {
+              .sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR,
+              .src = entries[i].accelStruct.vkHandle,
+              .dst = compactedAS.vkHandle,
+              .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR,
+          };
+          vkCmdCopyAccelerationStructureKHR(vkCmdBuf, &copyInfo);
+          pendingDestroy.push_back({i, entries[i].accelStruct.vkHandle});
+          entries[i].accelStruct = std::move(compactedAS);
+        }
+      }
+
+      wait(submit(cmdBuf, {}));
+
+      for (const auto& [idx, oldHandle] : pendingDestroy) {
+        vkDestroyAccelerationStructureKHR(vkDevice_, oldHandle, nullptr);
+      }
+    }
+
+    vkDestroyQueryPool(vkDevice_, compactionQueryPool, nullptr);
+  }
+
+  // Get device addresses and register in pool
+  for (uint32_t i = 0; i < count; i++) {
+    const VkAccelerationStructureDeviceAddressInfoKHR addrInfo = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+        .accelerationStructure = entries[i].accelStruct.vkHandle,
+    };
+    entries[i].accelStruct.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vkDevice_, &addrInfo);
+    outHandles[i] = accelStructuresPool_.create(std::move(entries[i].accelStruct));
+  }
+
+  awaitingCreation_ = true;
+  Result::setResult(outResult, Result());
 }
 
 lvk::AccelStructHandle lvk::VulkanContext::createTLAS(const AccelStructDesc& desc, Result* outResult) {
@@ -4865,7 +5219,8 @@ lvk::AccelStructHandle lvk::VulkanContext::createTLAS(const AccelStructDesc& des
       .accelerationStructure = accelStruct.vkHandle,
   };
   accelStruct.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vkDevice_, &accelerationDeviceAddressInfo);
-
+  
+  tLasCount++;
   return accelStructuresPool_.create(std::move(accelStruct));
 }
 
@@ -5108,7 +5463,7 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
     const VkPushConstantRange range = {
         .stageFlags = rps->shaderStageFlags_,
         .offset = 0,
-        .size = (uint32_t)getAlignedSize(pushConstantsSize, 16),
+        .size = (uint32_t)getAlignedSize(pushConstantsSize, pc_aligned_size),
     };
     const VkPipelineLayoutCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -5245,7 +5600,7 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RayTracingPipelineHandle handle) {
     const VkDescriptorSetLayout dsls[] = {dset.vkDSL, dset.vkDSL, dset.vkDSL, dset.vkDSL};
     const VkPushConstantRange range = {
         .stageFlags = rtps->shaderStageFlags_,
-        .size = (uint32_t)getAlignedSize(pushConstantsSize, 16),
+        .size = (uint32_t)getAlignedSize(pushConstantsSize, pc_aligned_size),
     };
 
     const VkPipelineLayoutCreateInfo ciPipelineLayout = {
@@ -5461,7 +5816,7 @@ VkPipeline lvk::VulkanContext::getVkPipeline(ComputePipelineHandle handle) {
       const VkPushConstantRange range = {
           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
           .offset = 0,
-          .size = (uint32_t)getAlignedSize(sm->pushConstantsSize, 16),
+          .size = (uint32_t)getAlignedSize(sm->pushConstantsSize, pc_aligned_size),
       };
       const VkPipelineLayoutCreateInfo ci = {
           .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -5848,6 +6203,14 @@ uint64_t lvk::VulkanContext::gpuAddress(AccelStructHandle handle) const {
   LVK_ASSERT(as && as->deviceAddress);
 
   return as ? (uint64_t)as->deviceAddress : 0u;
+}
+
+uint64_t lvk::VulkanContext::getAccelStructMemorySize(AccelStructHandle handle) const {
+  const lvk::AccelerationStructure* as = accelStructuresPool_.get(handle);
+  LVK_ASSERT(as);
+  const VulkanBuffer* buffer = as ? buffersPool_.get(as->buffer) : nullptr;
+  LVK_ASSERT(buffer);
+  return buffer ? uint64_t(buffer->bufferSize_) : 0u;
 }
 
 lvk::Result lvk::VulkanContext::upload(lvk::BufferHandle handle, const void* data, size_t size, size_t offset) {
@@ -6593,14 +6956,18 @@ lvk::Result lvk::VulkanContext::createInstance() {
     }
   }
 
+  std::vector<VkValidationFeatureEnableEXT> validationFeaturesEnabled;
+  if (config_.enableValidation) {
+    if (config_.enableValidationBestPractices) {
+      validationFeaturesEnabled.push_back(VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT);
+    }
 #if !defined(ANDROID)
-  // GPU Assisted Validation doesn't work on Android.
-  // It implicitly requires vertexPipelineStoresAndAtomics feature that's not supported even on high-end devices.
-  const VkValidationFeatureEnableEXT validationFeaturesEnabled[] = {
-      VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
-      VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT,
-  };
+    // GPU Assisted Validation doesn't work on Android.
+    // It implicitly requires vertexPipelineStoresAndAtomics feature that's not supported even on high-end devices.
+    validationFeaturesEnabled.push_back(VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT);
+    validationFeaturesEnabled.push_back(VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT);
 #endif // ANDROID
+  }
 
 #if defined(__APPLE__)
   // Shader validation doesn't work in MoltenVK for SPIR-V 1.6 under Vulkan 1.3:
@@ -6614,10 +6981,8 @@ lvk::Result lvk::VulkanContext::createInstance() {
   const VkValidationFeaturesEXT features = {
       .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
       .pNext = nullptr,
-#if !defined(ANDROID)
-      .enabledValidationFeatureCount = config_.enableValidation ? (uint32_t)LVK_ARRAY_NUM_ELEMENTS(validationFeaturesEnabled) : 0u,
-      .pEnabledValidationFeatures = config_.enableValidation ? validationFeaturesEnabled : nullptr,
-#endif
+      .enabledValidationFeatureCount = (uint32_t)validationFeaturesEnabled.size(),
+      .pEnabledValidationFeatures = validationFeaturesEnabled.empty() ? nullptr : validationFeaturesEnabled.data(),
 #if defined(__APPLE__)
       .disabledValidationFeatureCount = config_.enableValidation ? (uint32_t)LVK_ARRAY_NUM_ELEMENTS(validationFeaturesDisabled) : 0u,
       .pDisabledValidationFeatures = config_.enableValidation ? validationFeaturesDisabled : nullptr,
@@ -6681,7 +7046,11 @@ lvk::Result lvk::VulkanContext::createInstance() {
   const VkInstanceCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
 #if defined(VK_EXT_layer_settings) && VK_EXT_layer_settings
+#if defined(__APPLE__)
       .pNext = &layerSettingsCreateInfo,
+#else
+      .pNext = config_.enableValidation ? &layerSettingsCreateInfo : nullptr,
+#endif // __APPLE__
 #else
       .pNext = config_.enableValidation ? &features : nullptr,
 #endif // defined(VK_EXT_layer_settings) && VK_EXT_layer_settings
@@ -6886,7 +7255,7 @@ void lvk::VulkanContext::getBuildInfoBLAS(const AccelStructDesc& desc,
   const VkAccelerationStructureBuildGeometryInfoKHR accelerationBuildGeometryInfo{
       .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
       .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-      .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+      .flags = buildFlagsToVkBuildAccelerationStructureFlags(desc.buildFlags),
       .geometryCount = 1,
       .pGeometries = &outGeometry,
   };
@@ -7084,6 +7453,7 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
       .pNext = config_.extensionsDeviceFeatures,
       .storageBuffer16BitAccess = VK_TRUE,
+      .storageInputOutput16 = vkFeatures11_.storageInputOutput16, // enable if supported
       .multiview = vkFeatures11_.multiview, // enable if supported
       .samplerYcbcrConversion = vkFeatures11_.samplerYcbcrConversion, // enable if supported
       .shaderDrawParameters = VK_TRUE,
@@ -7835,8 +8205,12 @@ lvk::BufferHandle lvk::VulkanContext::createBuffer(VkDeviceSize bufferSize,
 
     // Initialize VmaAllocation Info
     if (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+      VmaAllocationCreateFlags vmaFlags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+      // if (!useStaging_) {
+      //   vmaFlags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+      // }
       vmaAllocInfo = {
-          .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+          .flags = vmaFlags,
           .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
           .preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
       };
@@ -7916,6 +8290,7 @@ void lvk::VulkanContext::bindDefaultDescriptorSets(VkCommandBuffer cmdBuf, VkPip
   const VkDescriptorSet dsets[4] = {dset, dset, dset, dset};
   vkCmdBindDescriptorSets(cmdBuf, bindPoint, layout, 0, (uint32_t)LVK_ARRAY_NUM_ELEMENTS(dsets), dsets, 0, nullptr);
 }
+#pragma optimize("", off)
 
 void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
   if (!awaitingCreation_) {
@@ -7958,7 +8333,7 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
   while (samplersPool_.objects_.size() > newMaxSamplers) {
     newMaxSamplers *= 2;
   }
-  while (accelStructuresPool_.objects_.size() > newMaxAccelStructs) {
+  while (tLasCount > newMaxAccelStructs) {
     newMaxAccelStructs *= 2;
   }
   growDescriptorPool(dset, newMaxTextures, newMaxSamplers, newMaxAccelStructs);
@@ -8049,8 +8424,12 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
   }();
 
   for (const auto& as : accelStructuresPool_.objects_) {
-    handlesAccelStructs.push_back(as.obj_.isTLAS ? as.obj_.vkHandle : dummyTLAS);
+    //handlesAccelStructs.push_back(as.obj_.isTLAS ? as.obj_.vkHandle : dummyTLAS);
+    if (as.obj_.isTLAS) {
+      handlesAccelStructs.push_back(as.obj_.vkHandle);
+    }
   }
+  tLasCount = handlesAccelStructs.size();
 
   VkWriteDescriptorSetAccelerationStructureKHR writeAccelStruct = {
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
@@ -8060,7 +8439,6 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
 
   VkWriteDescriptorSet write[kBinding_NumBindings] = {};
   uint32_t numWrites = 0;
-
   if (!handlesAccelStructs.empty()) {
     write[numWrites++] = VkWriteDescriptorSet{
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -8072,7 +8450,6 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
         .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
     };
   }
-
   if (!infoSampledImages.empty()) {
     write[numWrites++] = VkWriteDescriptorSet{
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -8133,6 +8510,7 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
 
   awaitingCreation_ = false;
 }
+#pragma optimize("", on)
 
 lvk::SamplerHandle lvk::VulkanContext::createSampler(const VkSamplerCreateInfo& ci,
                                                      lvk::Result* outResult,
