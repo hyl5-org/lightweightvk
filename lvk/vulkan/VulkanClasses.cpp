@@ -2420,7 +2420,10 @@ void lvk::CommandBuffer::cmdBeginRendering(const lvk::RenderPass& renderPass, co
     if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) {
       dstStageFlags |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
     }
-    bufferBarrier(deps.buffers[i], VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, dstStageFlags);
+    bufferBarrier(deps.buffers[i],
+                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  dstStageFlags);
   }
 
   const uint32_t numFbColorAttachments = fb.getNumColorAttachments();
@@ -2802,9 +2805,9 @@ void lvk::CommandBuffer::cmdFillBuffer(BufferHandle buffer, size_t bufferOffset,
 
   VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
 
-  // if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
-  //   dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  // }
+  if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+    dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  }
   if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) {
     dstStage |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
   }
