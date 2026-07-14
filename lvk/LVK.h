@@ -1093,6 +1093,7 @@ struct AccelStructDesc {
 
 struct Dependencies {
   lvk::Span<TextureHandle> textures = {};
+  lvk::Span<TextureHandle> storageImages = {};
   lvk::Span<BufferHandle> buffers = {};
   lvk::Span<TextureHandle> inputAttachments = {};
 };

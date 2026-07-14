@@ -7,6 +7,41 @@
 
 #include "XrUtils.h"
 
+#include <cctype>
+
+namespace {
+void parseExtensionString(std::string& storage, std::vector<const char*>& outPtrs) {
+  outPtrs.clear();
+  char* p = storage.data();
+  const char* const end = p + storage.size();
+  while (p < end) {
+    while (p < end && (std::isblank(static_cast<unsigned char>(*p)) || *p == '\0')) {
+      *p++ = '\0';
+    }
+    if (p < end) {
+      outPtrs.push_back(p);
+    }
+    while (p < end && (!std::isblank(static_cast<unsigned char>(*p)) && *p != '\0')) {
+      p++;
+    }
+  }
+}
+
+bool appendExtensions(const std::vector<const char*>& src, const char** dst) {
+  uint32_t idx = 0;
+  while (idx < lvk::kMaxCustomExtensions && dst[idx]) {
+    idx++;
+  }
+  for (const char* ext : src) {
+    if (!LVK_VERIFY(idx < lvk::kMaxCustomExtensions)) {
+      return false;
+    }
+    dst[idx++] = ext;
+  }
+  return true;
+}
+} // namespace
+
 // clang-format off
 const char* lvk::xrResultToString(XrResult result) {
   switch (result) {
@@ -86,6 +121,43 @@ const char* lvk::xrSessionStateToString(XrSessionState state) {
   }
 }
 // clang-format on
+
+bool lvk::appendOpenXRVulkanExtensions(XrInstance xrInstance,
+                                       XrSystemId xrSystemId,
+                                       lvk::ContextConfig& ctxCfg,
+                                       OpenXRVulkanExtensionStrings& storage) {
+  PFN_xrGetVulkanInstanceExtensionsKHR xrGetVulkanInstanceExtensions = nullptr;
+  PFN_xrGetVulkanDeviceExtensionsKHR xrGetVulkanDeviceExtensions = nullptr;
+
+  XR_ASSERT(xrGetInstanceProcAddr(xrInstance, "xrGetVulkanInstanceExtensionsKHR", (PFN_xrVoidFunction*)&xrGetVulkanInstanceExtensions));
+  XR_ASSERT(xrGetInstanceProcAddr(xrInstance, "xrGetVulkanDeviceExtensionsKHR", (PFN_xrVoidFunction*)&xrGetVulkanDeviceExtensions));
+
+  uint32_t numInstanceExts = 0;
+  XR_ASSERT(xrGetVulkanInstanceExtensions(xrInstance, xrSystemId, 0, &numInstanceExts, nullptr));
+  if (numInstanceExts) {
+    storage.instance.resize(numInstanceExts);
+    XR_ASSERT(xrGetVulkanInstanceExtensions(xrInstance, xrSystemId, numInstanceExts, &numInstanceExts, storage.instance.data()));
+    while (!storage.instance.empty() && storage.instance.back() == '\0') {
+      storage.instance.pop_back();
+    }
+    LLOGL("OpenXR required Vulkan instance extensions: %s\n", storage.instance.c_str());
+    parseExtensionString(storage.instance, storage.instanceNames);
+  }
+
+  uint32_t numDeviceExts = 0;
+  XR_ASSERT(xrGetVulkanDeviceExtensions(xrInstance, xrSystemId, 0, &numDeviceExts, nullptr));
+  if (numDeviceExts) {
+    storage.device.resize(numDeviceExts);
+    XR_ASSERT(xrGetVulkanDeviceExtensions(xrInstance, xrSystemId, numDeviceExts, &numDeviceExts, storage.device.data()));
+    while (!storage.device.empty() && storage.device.back() == '\0') {
+      storage.device.pop_back();
+    }
+    LLOGL("OpenXR required Vulkan device extensions: %s\n", storage.device.c_str());
+    parseExtensionString(storage.device, storage.deviceNames);
+  }
+
+  return appendExtensions(storage.instanceNames, ctxCfg.extensionsInstance) && appendExtensions(storage.deviceNames, ctxCfg.extensionsDevice);
+}
 
 std::unique_ptr<lvk::IContext> lvk::createVulkanContextXR(XrInstance xrInstance,
                                                           XrSystemId xrSystemId,

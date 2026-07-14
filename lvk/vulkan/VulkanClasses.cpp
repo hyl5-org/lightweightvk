@@ -64,8 +64,10 @@ enum Bindings {
   kBinding_Samplers = 1,
   kBinding_StorageImages = 2,
   kBinding_YUVImages = 3,
-  kBinding_AccelerationStructures = 4,
-  kBinding_NumBindings = 5,
+  kBinding_Texture2DArrays = 4,
+  kBinding_StorageImage2DArrays = 5,
+  kBinding_AccelerationStructures = 6,
+  kBinding_NumBindings = 7,
 };
 
 const uint32_t kDescriptorSet_InputAttachments = 4; // for VkDescriptorSetLayout in getVkPipeline()
@@ -2260,7 +2262,10 @@ void lvk::CommandBuffer::cmdDispatchThreadGroups(const Dimensions& threadgroupCo
   LVK_ASSERT(!isRendering_);
 
   for (size_t i = 0; i != deps.textures.size(); i++) {
-    useComputeTexture(deps.textures[i], VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    useComputeTexture(deps.textures[i], VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+  for (size_t i = 0; i != deps.storageImages.size(); i++) {
+    useComputeTexture(deps.storageImages[i], VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_IMAGE_LAYOUT_GENERAL);
   }
   for (size_t i = 0; i != deps.buffers.size(); i++) {
     const lvk::VulkanBuffer* buf = ctx_->buffersPool_.get(deps.buffers[i]);
@@ -2317,7 +2322,7 @@ void lvk::CommandBuffer::cmdPopDebugGroupLabel() const {
   vkCmdEndDebugUtilsLabelEXT(wrapper_->cmdBuf_);
 }
 
-void lvk::CommandBuffer::useComputeTexture(TextureHandle handle, VkPipelineStageFlags2 dstStage) {
+void lvk::CommandBuffer::useComputeTexture(TextureHandle handle, VkPipelineStageFlags2 dstStage, VkImageLayout imageLayout) {
   LVK_PROFILER_FUNCTION_COLOR(LVK_PROFILER_COLOR_BARRIER);
 
   LVK_ASSERT(!handle.empty());
@@ -2325,13 +2330,17 @@ void lvk::CommandBuffer::useComputeTexture(TextureHandle handle, VkPipelineStage
 
   (void)dstStage; // TODO: add extra dstStage
 
-  if (!tex.isStorageImage() && !tex.isSampledImage()) {
-    LVK_ASSERT_MSG(false, "Did you forget to specify TextureUsageBits::Storage or TextureUsageBits::Sampled on your texture?");
+  if (imageLayout == VK_IMAGE_LAYOUT_GENERAL && !tex.isStorageImage()) {
+    LVK_ASSERT_MSG(false, "Did you forget to specify TextureUsageBits::Storage on your texture?");
+    return;
+  }
+  if (imageLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && !tex.isSampledImage()) {
+    LVK_ASSERT_MSG(false, "Did you forget to specify TextureUsageBits::Sampled on your texture?");
     return;
   }
 
   tex.transitionLayout(wrapper_->cmdBuf_,
-                       tex.isStorageImage() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       imageLayout,
                        VkImageSubresourceRange{tex.getImageAspectFlags(), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
 }
 
@@ -3041,7 +3050,10 @@ void lvk::CommandBuffer::cmdTraceRays(uint32_t width, uint32_t height, uint32_t 
   LVK_ASSERT(!isRendering_);
 
   for (size_t i = 0; i != deps.textures.size(); i++) {
-    useComputeTexture(deps.textures[i], VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR);
+    useComputeTexture(deps.textures[i], VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+  for (size_t i = 0; i != deps.storageImages.size(); i++) {
+    useComputeTexture(deps.storageImages[i], VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_IMAGE_LAYOUT_GENERAL);
   }
   for (size_t i = 0; i != deps.buffers.size(); i++) {
     bufferBarrier(deps.buffers[i],
@@ -4616,6 +4628,34 @@ lvk::Holder<lvk::TextureHandle> lvk::VulkanContext::createTexture(const TextureD
 
   image.imageView_ = image.createImageView(
       vkDevice_, vkImageViewType, vkFormat, aspect, 0, VK_REMAINING_MIP_LEVELS, 0, numLayers, components, ycbcrInfo, debugNameImageView);
+  if (desc.type == TextureType_2D && numPlanes == 1 && vkSamples == VK_SAMPLE_COUNT_1_BIT) {
+    image.imageView2DArray_ = image.createImageView(vkDevice_,
+                                                    VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                    vkFormat,
+                                                    aspect,
+                                                    0,
+                                                    VK_REMAINING_MIP_LEVELS,
+                                                    0,
+                                                    numLayers,
+                                                    components,
+                                                    nullptr,
+                                                    debugNameImageView);
+    LVK_ASSERT(image.imageView2DArray_ != VK_NULL_HANDLE);
+    if (image.vkUsageFlags_ & VK_IMAGE_USAGE_STORAGE_BIT) {
+      image.imageViewStorage2DArray_ = image.createImageView(vkDevice_,
+                                                             VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                             vkFormat,
+                                                             aspect,
+                                                             0,
+                                                             VK_REMAINING_MIP_LEVELS,
+                                                             0,
+                                                             numLayers,
+                                                             {},
+                                                             nullptr,
+                                                             debugNameImageView);
+      LVK_ASSERT(image.imageViewStorage2DArray_ != VK_NULL_HANDLE);
+    }
+  }
 
   if (image.vkUsageFlags_ & VK_IMAGE_USAGE_STORAGE_BIT) {
     if (!desc.components.identity()) {
@@ -4668,6 +4708,8 @@ lvk::Holder<lvk::TextureHandle> lvk::VulkanContext::createTextureView(lvk::Textu
   image.isOwningVkImage_ = false;
 
   // drop all existing image views - they belong to the base image
+  memset(&image.imageView2DArray_, 0, sizeof(image.imageView2DArray_));
+  memset(&image.imageViewStorage2DArray_, 0, sizeof(image.imageViewStorage2DArray_));
   memset(&image.imageViewStorage_, 0, sizeof(image.imageViewStorage_));
   memset(&image.imageViewForFramebuffer_, 0, sizeof(image.imageViewForFramebuffer_));
   memset(&image.imageViewForFramebufferMultiview_, 0, sizeof(image.imageViewForFramebufferMultiview_));
@@ -4724,6 +4766,34 @@ lvk::Holder<lvk::TextureHandle> lvk::VulkanContext::createTextureView(lvk::Textu
   if (!LVK_VERIFY(image.imageView_ != VK_NULL_HANDLE)) {
     Result::setResult(outResult, Result::Code::RuntimeError, "Cannot create VkImageView");
     return {};
+  }
+  if (desc.type == TextureType_2D && image.vkSamples_ == VK_SAMPLE_COUNT_1_BIT) {
+    image.imageView2DArray_ = image.createImageView(vkDevice_,
+                                                    VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                    image.vkImageFormat_,
+                                                    aspect,
+                                                    desc.mipLevel,
+                                                    desc.numMipLevels,
+                                                    desc.layer,
+                                                    desc.numLayers,
+                                                    components,
+                                                    nullptr,
+                                                    debugName);
+    LVK_ASSERT(image.imageView2DArray_ != VK_NULL_HANDLE);
+    if (image.vkUsageFlags_ & VK_IMAGE_USAGE_STORAGE_BIT) {
+      image.imageViewStorage2DArray_ = image.createImageView(vkDevice_,
+                                                             VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                             image.vkImageFormat_,
+                                                             aspect,
+                                                             desc.mipLevel,
+                                                             desc.numMipLevels,
+                                                             desc.layer,
+                                                             desc.numLayers,
+                                                             {},
+                                                             nullptr,
+                                                             debugName);
+      LVK_ASSERT(image.imageViewStorage2DArray_ != VK_NULL_HANDLE);
+    }
   }
 
   if (image.vkUsageFlags_ & VK_IMAGE_USAGE_STORAGE_BIT) {
@@ -6103,6 +6173,14 @@ void lvk::VulkanContext::destroy(lvk::TextureHandle handle) {
 
   deferredTask(std::packaged_task<void()>(
       [device = getVkDevice(), imageView = tex->imageView_]() { vkDestroyImageView(device, imageView, nullptr); }));
+  if (tex->imageView2DArray_) {
+    deferredTask(std::packaged_task<void()>(
+        [device = getVkDevice(), imageView = tex->imageView2DArray_]() { vkDestroyImageView(device, imageView, nullptr); }));
+  }
+  if (tex->imageViewStorage2DArray_) {
+    deferredTask(std::packaged_task<void()>(
+        [device = getVkDevice(), imageView = tex->imageViewStorage2DArray_]() { vkDestroyImageView(device, imageView, nullptr); }));
+  }
   if (tex->imageViewStorage_) {
     deferredTask(std::packaged_task<void()>(
         [device = getVkDevice(), imageView = tex->imageViewStorage_]() { vkDestroyImageView(device, imageView, nullptr); }));
@@ -6515,6 +6593,7 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromGLSL(ShaderStag
           "#extension GL_EXT_buffer_reference : require\n"
           "#extension GL_EXT_buffer_reference_uvec2 : require\n"
           "#extension GL_EXT_debug_printf : enable\n"
+          "#extension GL_EXT_multiview : require\n"
           "#extension GL_EXT_nonuniform_qualifier : require\n"
           "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
           "#extension GL_EXT_mesh_shader : require\n";
@@ -6526,9 +6605,70 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromGLSL(ShaderStag
           "#extension GL_EXT_buffer_reference : require\n"
           "#extension GL_EXT_buffer_reference_uvec2 : require\n"
           "#extension GL_EXT_debug_printf : enable\n"
+          "#extension GL_EXT_multiview : require\n"
           "#extension GL_EXT_nonuniform_qualifier : require\n"
           "#extension GL_EXT_samplerless_texture_functions : require\n"
           "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+      sourcePatched +=
+          "layout (set = 0, binding = 0) uniform texture2D   kTextures2D[];\n"
+          "layout (set = 1, binding = 0) uniform texture3D   kTextures3D[];\n"
+          "layout (set = 2, binding = 0) uniform textureCube kTexturesCube[];\n"
+          "layout (set = 3, binding = 0) uniform texture2D   kTextures2DShadow[];\n"
+          "layout (set = 0, binding = 4) uniform texture2DArray kTextures2DArray[];\n"
+          "layout (set = 0, binding = 1) uniform sampler       kSamplers[];\n"
+          "layout (set = 3, binding = 1) uniform samplerShadow kSamplersShadow[];\n";
+      addCode("textureBindless2D(",
+              "vec4 textureBindless2D(uint textureid, uint samplerid, vec2 uv) {\n"
+              "  return texture(nonuniformEXT(sampler2D(kTextures2D[textureid], kSamplers[samplerid])), uv);\n"
+              "}\n");
+      addCode("textureBindless2DLod(",
+              "vec4 textureBindless2DLod(uint textureid, uint samplerid, vec2 uv, float lod) {\n"
+              "  return textureLod(nonuniformEXT(sampler2D(kTextures2D[textureid], kSamplers[samplerid])), uv, lod);\n"
+              "}\n");
+      addCode("textureBindless2DShadow(",
+              "float textureBindless2DShadow(uint textureid, uint samplerid, vec3 uvw) {"
+              "  return texture(nonuniformEXT(sampler2DShadow(kTextures2DShadow[textureid], kSamplersShadow[samplerid])), uvw);\n"
+              "}\n");
+      addCode("textureBindlessSize2D(",
+              "ivec2 textureBindlessSize2D(uint textureid) {\n"
+              "  return textureSize(nonuniformEXT(kTextures2D[textureid]), 0);\n"
+              "}\n");
+      addCode("textureBindless2DArray(",
+              "vec4 textureBindless2DArray(uint textureid, uint samplerid, vec2 uv, uint slice) {\n"
+              "  return texture(nonuniformEXT(sampler2DArray(kTextures2DArray[textureid], kSamplers[samplerid])), vec3(uv, float(slice)));\n"
+              "}\n");
+      addCode("textureBindless2DArrayLod(",
+              "vec4 textureBindless2DArrayLod(uint textureid, uint samplerid, vec2 uv, uint slice, float lod) {\n"
+              "  return textureLod(nonuniformEXT(sampler2DArray(kTextures2DArray[textureid], kSamplers[samplerid])), vec3(uv, float(slice)), lod);\n"
+              "}\n");
+      addCode("textureBindlessSize2DArray(",
+              "ivec3 textureBindlessSize2DArray(uint textureid) {\n"
+              "  return textureSize(nonuniformEXT(kTextures2DArray[textureid]), 0);\n"
+              "}\n");
+      addCode("textureBindlessCube(",
+              "vec4 textureBindlessCube(uint textureid, uint samplerid, vec3 uvw) {\n"
+              "  return texture(nonuniformEXT(samplerCube(kTexturesCube[textureid], kSamplers[samplerid])), uvw);\n"
+              "}\n");
+      addCode("textureBindlessCubeLod(",
+              "vec4 textureBindlessCubeLod(uint textureid, uint samplerid, vec3 uvw, float lod) {\n"
+              "  return textureLod(nonuniformEXT(samplerCube(kTexturesCube[textureid], kSamplers[samplerid])), uvw, lod);\n"
+              "}\n");
+      addCode("textureBindless3D(",
+              "vec4 textureBindless3D(uint textureid, uint samplerid, vec3 uvw) {\n"
+              "  return texture(nonuniformEXT(sampler3D(kTextures3D[textureid], kSamplers[samplerid])), uvw);\n"
+              "}\n");
+      addCode("textureBindless3DLod(",
+              "vec4 textureBindless3DLod(uint textureid, uint samplerid, vec3 uvw, float lod) {\n"
+              "  return textureLod(nonuniformEXT(sampler3D(kTextures3D[textureid], kSamplers[samplerid])), uvw, lod);\n"
+              "}\n");
+      addCode("textureBindlessQueryLevels2D(",
+              "int textureBindlessQueryLevels2D(uint textureid) {\n"
+              "  return textureQueryLevels(nonuniformEXT(kTextures2D[textureid]));\n"
+              "}\n");
+      addCode("textureBindlessQueryLevelsCube(",
+              "int textureBindlessQueryLevelsCube(uint textureid) {\n"
+              "  return textureQueryLevels(nonuniformEXT(kTexturesCube[textureid]));\n"
+              "}\n");
     }
     if (vkStage == VK_SHADER_STAGE_FRAGMENT_BIT) {
       // Note how nonuniformEXT() should be used:
@@ -6537,18 +6677,20 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromGLSL(ShaderStag
           "#version 460\n"
           "#extension GL_EXT_buffer_reference_uvec2 : require\n"
           "#extension GL_EXT_debug_printf : enable\n"
+          "#extension GL_EXT_multiview : require\n"
           "#extension GL_EXT_nonuniform_qualifier : require\n"
           "#extension GL_EXT_samplerless_texture_functions : require\n"
           "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
       addCode("kTLAS[",
               "#extension GL_EXT_buffer_reference : require\n"
               "#extension GL_EXT_ray_query : require\n"
-              "layout(set = 0, binding = 4) uniform accelerationStructureEXT kTLAS[];\n");
+              "layout(set = 0, binding = 6) uniform accelerationStructureEXT kTLAS[];\n");
       sourcePatched +=
           "layout (set = 0, binding = 0) uniform texture2D   kTextures2D[];\n"
           "layout (set = 1, binding = 0) uniform texture3D   kTextures3D[];\n"
           "layout (set = 2, binding = 0) uniform textureCube kTexturesCube[];\n"
           "layout (set = 3, binding = 0) uniform texture2D   kTextures2DShadow[];\n"
+          "layout (set = 0, binding = 4) uniform texture2DArray kTextures2DArray[];\n"
           "layout (set = 0, binding = 1) uniform sampler       kSamplers[];\n"
           "layout (set = 3, binding = 1) uniform samplerShadow kSamplersShadow[];\n"
           "layout (set = 0, binding = 3) uniform sampler2D     kSamplersYUV[];\n";
@@ -6567,6 +6709,18 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromGLSL(ShaderStag
       addCode("textureBindlessSize2D(",
               "ivec2 textureBindlessSize2D(uint textureid) {\n"
               "  return textureSize(nonuniformEXT(kTextures2D[textureid]), 0);\n"
+              "}\n");
+      addCode("textureBindless2DArray(",
+              "vec4 textureBindless2DArray(uint textureid, uint samplerid, vec2 uv, uint slice) {\n"
+              "  return texture(nonuniformEXT(sampler2DArray(kTextures2DArray[textureid], kSamplers[samplerid])), vec3(uv, float(slice)));\n"
+              "}\n");
+      addCode("textureBindless2DArrayLod(",
+              "vec4 textureBindless2DArrayLod(uint textureid, uint samplerid, vec2 uv, uint slice, float lod) {\n"
+              "  return textureLod(nonuniformEXT(sampler2DArray(kTextures2DArray[textureid], kSamplers[samplerid])), vec3(uv, float(slice)), lod);\n"
+              "}\n");
+      addCode("textureBindlessSize2DArray(",
+              "ivec3 textureBindlessSize2DArray(uint textureid) {\n"
+              "  return textureSize(nonuniformEXT(kTextures2DArray[textureid]), 0);\n"
               "}\n");
       addCode("textureBindlessCube(",
               "vec4 textureBindlessCube(uint textureid, uint samplerid, vec3 uvw) {\n"
@@ -6656,10 +6810,11 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromSlang(ShaderSta
       "[[vk::binding(0, 1)]] Texture3D    kTextures3D[];\n"
       "[[vk::binding(0, 2)]] TextureCube  kTexturesCube[];\n"
       "[[vk::binding(0, 3)]] Texture2D    kTextures2DShadow[];\n"
+      "[[vk::binding(4, 0)]] Texture2DArray kTextures2DArray[];\n"
       "[[vk::binding(1, 0)]] SamplerState kSamplers[];\n"
       "[[vk::binding(1, 3)]] SamplerComparisonState kSamplersShadow[];\n"
       "[[vk::binding(3, 0)]] Sampler2D    kSamplersYUV[];\n";
-  addCode("kTLAS[", "[[vk::binding(4, 0)]] RaytracingAccelerationStructure kTLAS[];\n");
+  addCode("kTLAS[", "[[vk::binding(6, 0)]] RaytracingAccelerationStructure kTLAS[];\n");
   addCode("textureBindless2D(",
           "float4 textureBindless2D(uint textureid, uint samplerid, float2 uv) {\n"
           "  return kTextures2D[NonUniformResourceIndex(textureid)].Sample(\n"
@@ -6680,6 +6835,22 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromSlang(ShaderSta
           "  uint width, height;\n"
           "  kTextures2D[NonUniformResourceIndex(textureid)].GetDimensions(width, height);\n"
           "  return int2(width, height);\n"
+          "}\n");
+  addCode("textureBindless2DArray(",
+          "float4 textureBindless2DArray(uint textureid, uint samplerid, float2 uv, uint slice) {\n"
+          "  return kTextures2DArray[NonUniformResourceIndex(textureid)].Sample(\n"
+          "    kSamplers[NonUniformResourceIndex(samplerid)], float3(uv, float(slice)));\n"
+          "}\n");
+  addCode("textureBindless2DArrayLod(",
+          "float4 textureBindless2DArrayLod(uint textureid, uint samplerid, float2 uv, uint slice, float lod) {\n"
+          "  return kTextures2DArray[NonUniformResourceIndex(textureid)].SampleLevel(\n"
+          "    kSamplers[NonUniformResourceIndex(samplerid)], float3(uv, float(slice)), lod);\n"
+          "}\n");
+  addCode("textureBindlessSize2DArray(",
+          "int3 textureBindlessSize2DArray(uint textureid) {\n"
+          "  uint width, height, layers;\n"
+          "  kTextures2DArray[NonUniformResourceIndex(textureid)].GetDimensions(width, height, layers);\n"
+          "  return int3(width, height, layers);\n"
           "}\n");
   addCode("textureBindless2DShadow(",
           "float textureBindless2DShadow(uint textureid, uint samplerid, float3 uvw) {\n"
@@ -7634,6 +7805,7 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   addOptionalExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, has_EXT_device_fault_, &deviceFaultFeatures);
   addOptionalExtension(VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME, has_EXT_shader_tile_image, &shaderTileImageFeatures);
   addOptionalExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME, has_EXT_mesh_shader_, &meshShaderFeatures);
+  addOptionalExtension(VK_KHR_MULTIVIEW_EXTENSION_NAME, has_KHR_multiview_);
   addOptionalExtension(VK_KHR_SHARED_PRESENTABLE_IMAGE_EXTENSION_NAME, has_KHR_shared_presentable_image_);
   addOptionalExtension(
       VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, has_KHR_present_mode_fifo_latest_ready_, &presentModeLatestReadyFeatures);
@@ -8019,14 +8191,21 @@ lvk::Result lvk::VulkanContext::growDescriptorPool(VulkanContext::DescriptorSet&
   LLOGL("growDescriptorPool(%u, %u)\n", maxTextures, maxSamplers);
 #endif // LVK_VULKAN_PRINT_COMMANDS
 
-  if (!LVK_VERIFY(maxTextures <= vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindSampledImages)) {
+  const uint32_t maxSampledImageDescriptors = maxTextures * 2;
+  const uint32_t maxStorageImageDescriptors = maxTextures * 2;
+  if (!LVK_VERIFY(maxSampledImageDescriptors <= vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindSampledImages)) {
     LLOGW("Max Textures exceeded: %u (max %u)",
-          maxTextures,
+          maxSampledImageDescriptors,
           vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindSampledImages);
   }
 
   if (!LVK_VERIFY(maxSamplers <= vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindSamplers)) {
     LLOGW("Max Samplers exceeded %u (max %u)", maxSamplers, vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindSamplers);
+  }
+  if (!LVK_VERIFY(maxStorageImageDescriptors <= vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindStorageImages)) {
+    LLOGW("Max Storage Images exceeded %u (max %u)",
+          maxStorageImageDescriptors,
+          vkPhysicalDeviceVulkan12Properties_.maxDescriptorSetUpdateAfterBindStorageImages);
   }
 
   if (dset.vkDSL != VK_NULL_HANDLE) {
@@ -8094,6 +8273,8 @@ lvk::Result lvk::VulkanContext::growDescriptorPool(VulkanContext::DescriptorSet&
                          (uint32_t)immutableSamplers.size() ? (workaround_noYcbcrSamplerArray_ ? 1u : maxTextures) : 0,
                          stageFlags,
                          immutableSamplersData),
+      lvk::getDSLBinding(kBinding_Texture2DArrays, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, maxTextures, stageFlags),
+      lvk::getDSLBinding(kBinding_StorageImage2DArrays, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxTextures, stageFlags),
       lvk::getDSLBinding(kBinding_AccelerationStructures, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, maxAccelStructs, stageFlags),
   };
   const uint32_t flags = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT |
@@ -8121,9 +8302,9 @@ lvk::Result lvk::VulkanContext::growDescriptorPool(VulkanContext::DescriptorSet&
   {
     // create default descriptor pool and allocate 1 descriptor set
     VkDescriptorPoolSize poolSizes[kBinding_NumBindings] = {
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, maxTextures},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, maxSampledImageDescriptors},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, maxSamplers},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxTextures},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxStorageImageDescriptors},
     };
     uint32_t numPoolSizes = 3;
     if (!immutableSamplers.empty()) {
@@ -8340,11 +8521,15 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
 
   // 1. Sampled and storage images
   std::vector<VkDescriptorImageInfo> infoSampledImages;
+  std::vector<VkDescriptorImageInfo> infoTexture2DArrays;
   std::vector<VkDescriptorImageInfo> infoStorageImages;
+  std::vector<VkDescriptorImageInfo> infoStorageImage2DArrays;
   std::vector<VkDescriptorImageInfo> infoYUVImages;
 
   infoSampledImages.reserve(texturesPool_.numObjects());
+  infoTexture2DArrays.reserve(texturesPool_.numObjects());
   infoStorageImages.reserve(texturesPool_.numObjects());
+  infoStorageImage2DArrays.reserve(texturesPool_.numObjects());
 
   const bool hasYcbcrSamplers = pimpl_->numYcbcrSamplers_ > 0;
 
@@ -8354,6 +8539,11 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
 
   // use dummies to avoid sparse arrays
   VkImageView dummyImageView = texturesPool_.objects_[0].obj_.imageView_;
+  VkImageView dummyImageView2DArray =
+      texturesPool_.objects_[0].obj_.imageView2DArray_ ? texturesPool_.objects_[0].obj_.imageView2DArray_ : dummyImageView;
+  VkImageView dummyStorageImageView2DArray = texturesPool_.objects_[0].obj_.imageViewStorage2DArray_
+                                                ? texturesPool_.objects_[0].obj_.imageViewStorage2DArray_
+                                                : dummyImageView2DArray;
   VkSampler dummySampler = samplersPool_.objects_[0].obj_;
 
   for (const auto& obj : texturesPool_.objects_) {
@@ -8364,18 +8554,33 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
     const bool isTextureAvailable = (img.vkSamples_ & VK_SAMPLE_COUNT_1_BIT) == VK_SAMPLE_COUNT_1_BIT;
     const bool isYUVImage = isTextureAvailable && img.isSampledImage() && lvk::getNumImagePlanes(img.vkImageFormat_) > 1;
     const bool isSampledImage = isTextureAvailable && img.isSampledImage() && !isYUVImage;
+    const bool isTexture2DArrayAvailable = isSampledImage && img.vkType_ == VK_IMAGE_TYPE_2D && img.imageView2DArray_;
     const bool isStorageImage = isTextureAvailable && img.isStorageImage();
+    const bool isStorageImage2DArrayAvailable =
+        isStorageImage && img.vkType_ == VK_IMAGE_TYPE_2D && img.imageViewStorage2DArray_;
     infoSampledImages.push_back(VkDescriptorImageInfo{
         .sampler = VK_NULL_HANDLE,
         .imageView = isSampledImage ? view : dummyImageView,
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     });
     LVK_ASSERT(infoSampledImages.back().imageView != VK_NULL_HANDLE);
+    infoTexture2DArrays.push_back(VkDescriptorImageInfo{
+        .sampler = VK_NULL_HANDLE,
+        .imageView = isTexture2DArrayAvailable ? img.imageView2DArray_ : dummyImageView2DArray,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    });
+    LVK_ASSERT(infoTexture2DArrays.back().imageView != VK_NULL_HANDLE);
     infoStorageImages.push_back(VkDescriptorImageInfo{
         .sampler = VK_NULL_HANDLE,
         .imageView = isStorageImage ? storageView : dummyImageView,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     });
+    infoStorageImage2DArrays.push_back(VkDescriptorImageInfo{
+        .sampler = VK_NULL_HANDLE,
+        .imageView = isStorageImage2DArrayAvailable ? img.imageViewStorage2DArray_ : dummyStorageImageView2DArray,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    });
+    LVK_ASSERT(infoStorageImage2DArrays.back().imageView != VK_NULL_HANDLE);
     if (hasYcbcrSamplers && !workaround_noYcbcrSamplerArray_) {
       // we don't need to update this if there're no YUV samplers
       infoYUVImages.push_back(VkDescriptorImageInfo{
@@ -8474,6 +8679,18 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
     };
   }
 
+  if (!infoTexture2DArrays.empty()) {
+    write[numWrites++] = VkWriteDescriptorSet{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = dset.vkDSet,
+        .dstBinding = kBinding_Texture2DArrays,
+        .dstArrayElement = 0,
+        .descriptorCount = (uint32_t)infoTexture2DArrays.size(),
+        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .pImageInfo = infoTexture2DArrays.data(),
+    };
+  }
+
   if (!infoStorageImages.empty()) {
     write[numWrites++] = VkWriteDescriptorSet{
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -8483,6 +8700,18 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
         .descriptorCount = (uint32_t)infoStorageImages.size(),
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         .pImageInfo = infoStorageImages.data(),
+    };
+  }
+
+  if (!infoStorageImage2DArrays.empty()) {
+    write[numWrites++] = VkWriteDescriptorSet{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = dset.vkDSet,
+        .dstBinding = kBinding_StorageImage2DArrays,
+        .dstArrayElement = 0,
+        .descriptorCount = (uint32_t)infoStorageImage2DArrays.size(),
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo = infoStorageImage2DArrays.data(),
     };
   }
 

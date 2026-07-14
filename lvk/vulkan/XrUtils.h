@@ -18,6 +18,8 @@
 #endif // !defined(XR_USE_GRAPHICS_API_VULKAN)
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <string>
+#include <vector>
 
 #define XR_ASSERT(func)                                                                                                             \
   {                                                                                                                                 \
@@ -30,8 +32,20 @@
 
 namespace lvk {
 
+struct OpenXRVulkanExtensionStrings {
+  std::string instance;
+  std::string device;
+  std::vector<const char*> instanceNames;
+  std::vector<const char*> deviceNames;
+};
+
 const char* xrResultToString(XrResult result);
 const char* xrSessionStateToString(XrSessionState state);
+
+bool appendOpenXRVulkanExtensions(XrInstance xrInstance,
+                                  XrSystemId xrSystemId,
+                                  lvk::ContextConfig& ctxCfg,
+                                  OpenXRVulkanExtensionStrings& storage);
 
 std::unique_ptr<lvk::IContext> createVulkanContextXR(XrInstance xrInstance,
                                                      XrSystemId xrSystemId,

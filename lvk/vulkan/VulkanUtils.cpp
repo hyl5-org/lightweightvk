@@ -1354,6 +1354,127 @@ VkPhysicalDevice lvk::getVkPhysicalDevice(const IContext* ctx) {
   return static_cast<const VulkanContext*>(ctx)->getVkPhysicalDevice();
 }
 
+lvk::Holder<lvk::TextureHandle> lvk::createTextureFromVkImage(IContext* ctx,
+                                                              const VulkanNativeTextureDesc& desc,
+                                                              Result* outResult) {
+  if (!ctx || desc.image == VK_NULL_HANDLE || desc.format == VK_FORMAT_UNDEFINED || desc.extent.width == 0 ||
+      desc.extent.height == 0 || desc.extent.depth == 0 || desc.numLevels == 0 || desc.numLayers == 0 || desc.usage == 0) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Invalid native Vulkan image description");
+    return {};
+  }
+
+  VulkanContext* vkCtx = static_cast<VulkanContext*>(ctx);
+  const bool isDepth = VulkanImage::isDepthFormat(desc.format);
+  const bool isStencil = VulkanImage::isStencilFormat(desc.format);
+  VkImageAspectFlags aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0;
+  aspect |= isStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0;
+  if (!aspect) {
+    aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+  }
+
+  char debugNameImage[256] = {};
+  char debugNameImageView[256] = {};
+  const bool hasDebugName = desc.debugName && *desc.debugName;
+  if (hasDebugName) {
+    snprintf(debugNameImage, sizeof(debugNameImage) - 1, "Image: %s", desc.debugName);
+    snprintf(debugNameImageView, sizeof(debugNameImageView) - 1, "Image View: %s", desc.debugName);
+  }
+
+  VulkanImage image = {};
+  image.vkImage_ = desc.image;
+  image.vkUsageFlags_ = desc.usage;
+  image.vkExtent_ = desc.extent;
+  image.vkType_ = desc.imageType;
+  image.vkImageFormat_ = desc.format;
+  image.vkSamples_ = desc.samples;
+  image.isSwapchainImage_ = desc.isSwapchainImage;
+  image.isOwningVkImage_ = false;
+  image.numLevels_ = desc.numLevels;
+  image.numLayers_ = desc.numLayers;
+  image.isDepthFormat_ = isDepth;
+  image.isStencilFormat_ = isStencil;
+  image.vkImageLayout_ = desc.initialLayout;
+
+  if (hasDebugName) {
+    snprintf(image.debugName_, sizeof(image.debugName_) - 1, "%s", desc.debugName);
+    VK_ASSERT(lvk::setDebugObjectName(vkCtx->getVkDevice(), VK_OBJECT_TYPE_IMAGE, (uint64_t)image.vkImage_, debugNameImage));
+  }
+
+  {
+    VkFormatProperties2 props = {
+        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+    };
+    vkGetPhysicalDeviceFormatProperties2(vkCtx->getVkPhysicalDevice(), desc.format, &props);
+    image.vkFormatProperties_ = props.formatProperties;
+  }
+
+  const VkImageViewType defaultViewType = [&desc]() {
+    switch (desc.imageType) {
+    case VK_IMAGE_TYPE_2D:
+      return desc.numLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    case VK_IMAGE_TYPE_3D:
+      return VK_IMAGE_VIEW_TYPE_3D;
+    default:
+      return VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    }
+  }();
+
+  if (defaultViewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Unsupported native Vulkan image type");
+    return {};
+  }
+
+  image.imageView_ = image.createImageView(vkCtx->getVkDevice(),
+                                           defaultViewType,
+                                           desc.format,
+                                           aspect,
+                                           0,
+                                           desc.numLevels,
+                                           0,
+                                           desc.numLayers,
+                                           {},
+                                           nullptr,
+                                           debugNameImageView);
+
+  if (desc.imageType == VK_IMAGE_TYPE_2D && desc.samples == VK_SAMPLE_COUNT_1_BIT) {
+    image.imageView2DArray_ = image.createImageView(vkCtx->getVkDevice(),
+                                                    VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                    desc.format,
+                                                    aspect,
+                                                    0,
+                                                    desc.numLevels,
+                                                    0,
+                                                    desc.numLayers,
+                                                    {},
+                                                    nullptr,
+                                                    debugNameImageView);
+    if (desc.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+      image.imageViewStorage2DArray_ = image.createImageView(vkCtx->getVkDevice(),
+                                                             VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                                             desc.format,
+                                                             aspect,
+                                                             0,
+                                                             desc.numLevels,
+                                                             0,
+                                                             desc.numLayers,
+                                                             {},
+                                                             nullptr,
+                                                             debugNameImageView);
+    }
+  }
+
+  if (!LVK_VERIFY(image.imageView_ != VK_NULL_HANDLE)) {
+    Result::setResult(outResult, Result::Code::RuntimeError, "Cannot create VkImageView for native Vulkan image");
+    return {};
+  }
+
+  const TextureHandle handle = vkCtx->texturesPool_.create(std::move(image));
+  vkCtx->awaitingCreation_ = true;
+  Result::setResult(outResult, Result());
+
+  return {ctx, handle};
+}
+
 VkCommandBuffer lvk::getVkCommandBuffer(const ICommandBuffer& buffer) {
   return static_cast<const lvk::CommandBuffer&>(buffer).getVkCommandBuffer();
 }

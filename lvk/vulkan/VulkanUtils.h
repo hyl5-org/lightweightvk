@@ -134,6 +134,21 @@ VkCompareOp compareOpToVkCompareOp(lvk::CompareOp func);
 VkExtent2D getImagePlaneExtent(VkExtent2D plane0, lvk::Format format, uint32_t plane);
 
 // raw Vulkan helpers: use this if you want to interop LightweightVK API with your own raw Vulkan API calls
+struct VulkanNativeTextureDesc {
+  VkImage image = VK_NULL_HANDLE;
+  VkImageType imageType = VK_IMAGE_TYPE_2D;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkExtent3D extent = {};
+  VkImageUsageFlags usage = 0;
+  VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+  uint32_t numLevels = 1;
+  uint32_t numLayers = 1;
+  VkImageLayout initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  bool isSwapchainImage = false;
+  const char* debugName = nullptr;
+};
+
+Holder<TextureHandle> createTextureFromVkImage(IContext* ctx, const VulkanNativeTextureDesc& desc, Result* outResult = nullptr);
 VkDevice getVkDevice(const IContext* ctx);
 VkPhysicalDevice getVkPhysicalDevice(const IContext* ctx);
 VkCommandBuffer getVkCommandBuffer(const ICommandBuffer& buffer);

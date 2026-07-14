@@ -112,6 +112,8 @@ struct VulkanImage final {
   mutable VkImageLayout vkImageLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   // precached image views - owned by this VulkanImage
   VkImageView imageView_ = VK_NULL_HANDLE; // default view with all mip-levels
+  VkImageView imageView2DArray_ = VK_NULL_HANDLE; // 2D array view for bindless texture2DArray access
+  VkImageView imageViewStorage2DArray_ = VK_NULL_HANDLE; // 2D array view for bindless image2DArray access
   VkImageView imageViewStorage_ = VK_NULL_HANDLE; // default view with identity swizzle (all mip-levels)
   VkImageView imageViewForFramebuffer_[LVK_MAX_MIP_LEVELS][6] = {}; // max 6 faces for cubemap rendering
   VkImageView imageViewForFramebufferMultiview_[LVK_MAX_MIP_LEVELS] = {};
@@ -456,7 +458,7 @@ class CommandBuffer final : public ICommandBuffer {
   }
 
  private:
-  void useComputeTexture(TextureHandle texture, VkPipelineStageFlags2 dstStage);
+  void useComputeTexture(TextureHandle texture, VkPipelineStageFlags2 dstStage, VkImageLayout imageLayout);
   void bufferBarrier(BufferHandle handle,
                      VkPipelineStageFlags2 srcStage,
                      VkPipelineStageFlags2 dstStage,
@@ -802,6 +804,7 @@ class VulkanContext final : public IContext {
   bool has_MVK_macos_surface_ = false;
   bool has_KHR_shared_presentable_image_ = false;
   bool has_KHR_present_mode_fifo_latest_ready_ = false;
+  bool has_KHR_multiview_ = false;
   std::vector<const char*> enabledInstanceExtensionNames_;
   std::vector<const char*> enabledDeviceExtensionNames_;
 
