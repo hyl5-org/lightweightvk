@@ -274,6 +274,7 @@ class VulkanPipelineBuilder final {
                                           uint32_t numColorAttachments);
   VulkanPipelineBuilder& depthAttachmentFormat(VkFormat format);
   VulkanPipelineBuilder& stencilAttachmentFormat(VkFormat format);
+  VulkanPipelineBuilder& fragmentShadingRateAttachment(bool enabled);
   VulkanPipelineBuilder& patchControlPoints(uint32_t numPoints);
 
   VkResult build(VkDevice device,
@@ -308,6 +309,7 @@ class VulkanPipelineBuilder final {
 
   VkFormat depthAttachmentFormat_ = VK_FORMAT_UNDEFINED;
   VkFormat stencilAttachmentFormat_ = VK_FORMAT_UNDEFINED;
+  bool fragmentShadingRateAttachment_ = false;
 
   static uint32_t numPipelinesCreated_;
 };
@@ -604,6 +606,9 @@ class VulkanContext final : public IContext {
   PresentMode getCurrentPresentMode() const override;
 
   uint32_t getFramebufferMSAABitMask() const override;
+  [[nodiscard]] FragmentShadingRateCapabilities getFragmentShadingRateCapabilities() const override {
+    return fragmentShadingRateCapabilities_;
+  }
   bool isExtensionEnabled(const char* ext) const override;
 
   double getTimestampPeriodToMs() const override;
@@ -723,6 +728,8 @@ class VulkanContext final : public IContext {
   VkPhysicalDeviceVulkan11Features vkFeatures11_ = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                     .pNext = &vkFeatures12_};
   VkPhysicalDeviceFeatures2 vkFeatures10_ = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vkFeatures11_};
+  VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragmentShadingRateFeatures_ = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
 
  public:
   VkPhysicalDeviceRayTracingPipelinePropertiesKHR rayTracingPipelineProperties_ = {
@@ -757,6 +764,9 @@ class VulkanContext final : public IContext {
       &vkPhysicalDeviceVulkan11Properties_,
       VkPhysicalDeviceProperties{},
   };
+  VkPhysicalDeviceFragmentShadingRatePropertiesKHR fragmentShadingRateProperties_ = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+  FragmentShadingRateCapabilities fragmentShadingRateCapabilities_ = {};
 
   std::vector<VkFormat> deviceDepthFormats_;
   std::vector<VkSurfaceFormatKHR> deviceSurfaceFormats_;
@@ -805,6 +815,7 @@ class VulkanContext final : public IContext {
   bool has_KHR_shared_presentable_image_ = false;
   bool has_KHR_present_mode_fifo_latest_ready_ = false;
   bool has_KHR_multiview_ = false;
+  bool has_KHR_fragment_shading_rate_ = false;
   std::vector<const char*> enabledInstanceExtensionNames_;
   std::vector<const char*> enabledDeviceExtensionNames_;
 

@@ -2029,6 +2029,11 @@ lvk::VulkanPipelineBuilder& lvk::VulkanPipelineBuilder::stencilAttachmentFormat(
   return *this;
 }
 
+lvk::VulkanPipelineBuilder& lvk::VulkanPipelineBuilder::fragmentShadingRateAttachment(bool enabled) {
+  fragmentShadingRateAttachment_ = enabled;
+  return *this;
+}
+
 lvk::VulkanPipelineBuilder& lvk::VulkanPipelineBuilder::patchControlPoints(uint32_t numPoints) {
   tessellationState_.patchControlPoints = numPoints;
   return *this;
@@ -2117,9 +2122,17 @@ VkResult lvk::VulkanPipelineBuilder::build(VkDevice device,
       .attachmentCount = numColorAttachments_,
       .pAttachments = colorBlendAttachmentStates_,
   };
+  const VkPipelineFragmentShadingRateStateCreateInfoKHR fragmentShadingRateState = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR,
+      .fragmentSize = {1, 1},
+      .combinerOps = {
+          VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+          VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR,
+      },
+  };
   const VkPipelineRenderingCreateInfo renderingInfo = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
-      .pNext = nullptr,
+      .pNext = fragmentShadingRateAttachment_ ? &fragmentShadingRateState : nullptr,
       .viewMask = viewMask_,
       .colorAttachmentCount = numColorAttachments_,
       .pColorAttachmentFormats = colorAttachmentFormats_,
@@ -2130,7 +2143,10 @@ VkResult lvk::VulkanPipelineBuilder::build(VkDevice device,
   const VkGraphicsPipelineCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
       .pNext = &renderingInfo,
-      .flags = 0,
+      .flags = fragmentShadingRateAttachment_
+                   ? VkPipelineCreateFlags(
+                         VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+                   : VkPipelineCreateFlags(0),
       .stageCount = numShaderStages_,
       .pStages = shaderStages_,
       .pVertexInputState = &vertexInputState_,
@@ -2467,6 +2483,21 @@ void lvk::CommandBuffer::cmdBeginRendering(const lvk::RenderPass& renderPass, co
                                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                      VkImageSubresourceRange{flags, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
   }
+  lvk::VulkanImage* fragmentShadingRateImage = nullptr;
+  if (TextureHandle handle = fb.fragmentShadingRate.texture) {
+    LVK_ASSERT_MSG(ctx_->has_KHR_fragment_shading_rate_, "VK_KHR_fragment_shading_rate is not enabled");
+    fragmentShadingRateImage = ctx_->texturesPool_.get(handle);
+    LVK_ASSERT(fragmentShadingRateImage);
+    LVK_ASSERT_MSG(fragmentShadingRateImage->vkImageFormat_ == VK_FORMAT_R8_UINT,
+                   "Fragment shading rate attachments must use lvk::Format_R_UI8");
+    LVK_ASSERT_MSG(fragmentShadingRateImage->vkUsageFlags_ & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR,
+                   "Fragment shading rate texture is missing TextureUsageBits_FragmentShadingRateAttachment");
+    fragmentShadingRateImage->transitionLayout(
+        wrapper_->cmdBuf_,
+        VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR,
+        VkImageSubresourceRange{
+            VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
+  }
 
   // calculate and transition input attachments
   {
@@ -2601,10 +2632,26 @@ void lvk::CommandBuffer::cmdBeginRendering(const lvk::RenderPass& renderPass, co
   VkRenderingAttachmentInfo stencilAttachment = depthAttachment;
 
   const bool isStencilFormat = (renderPass.stencil.loadOp != lvk::LoadOp_DontCare) || (renderPass.stencil.storeOp != lvk::StoreOp_DontCare);
+  VkRenderingFragmentShadingRateAttachmentInfoKHR fragmentShadingRateAttachment = {};
+  if (fragmentShadingRateImage) {
+    const uint32_t texelWidth = fb.fragmentShadingRate.texelWidth;
+    const uint32_t texelHeight = fb.fragmentShadingRate.texelHeight;
+    LVK_ASSERT(texelWidth && texelHeight);
+    LVK_ASSERT_MSG(fragmentShadingRateImage->vkExtent_.width * texelWidth >= width &&
+                       fragmentShadingRateImage->vkExtent_.height * texelHeight >= height,
+                   "Fragment shading rate attachment does not cover the render area");
+    fragmentShadingRateAttachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR,
+        .imageView =
+            fragmentShadingRateImage->getOrCreateVkImageViewForFramebuffer(*ctx_, 0, 0, viewMask_),
+        .imageLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR,
+        .shadingRateAttachmentTexelSize = {texelWidth, texelHeight},
+    };
+  }
 
   const VkRenderingInfo renderingInfo = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-      .pNext = nullptr,
+      .pNext = fragmentShadingRateImage ? &fragmentShadingRateAttachment : nullptr,
       .flags = 0,
       .renderArea = {VkOffset2D{(int32_t)scissor.x, (int32_t)scissor.y}, VkExtent2D{scissor.width, scissor.height}},
       .layerCount = renderPass.layerCount,
@@ -3583,6 +3630,13 @@ void lvk::VulkanStagingDevice::imageData2D(VulkanImage& image,
   if (numPlanes == 3) {
     imageAspect = VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT;
   }
+  const VkImageLayout finalLayout =
+      image.isSampledImage()
+          ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+          : (image.vkUsageFlags_ & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+                ? VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR
+                : VK_IMAGE_LAYOUT_GENERAL;
+  const StageAccess finalStageAccess = getPipelineStageAccess(finalLayout);
 
   // https://registry.khronos.org/KTX/specs/1.0/ktxspec.v1.html
   for (uint32_t mipLevel = 0; mipLevel < numMipLevels; ++mipLevel) {
@@ -3641,21 +3695,21 @@ void lvk::VulkanStagingDevice::imageData2D(VulkanImage& image,
         planeOffset += lvk::getTextureBytesPerPlane(imageRegion.extent.width, imageRegion.extent.height, vkFormatToFormat(format), plane);
       }
 
-      // 3. Transition TRANSFER_DST_OPTIMAL into SHADER_READ_ONLY_OPTIMAL
+      // 3. Transition TRANSFER_DST_OPTIMAL into the texture's first-use layout.
       lvk::imageMemoryBarrier2(
           wrapper.cmdBuf_,
           image.vkImage_,
           StageAccess{.stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT, .access = VK_ACCESS_2_TRANSFER_WRITE_BIT},
-          StageAccess{.stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .access = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT},
+          finalStageAccess,
           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          finalLayout,
           VkImageSubresourceRange{imageAspect, currentMipLevel, 1, layer, 1});
 
       offset += lvk::getTextureBytesPerLayer(imageRegion.extent.width, imageRegion.extent.height, texFormat, currentMipLevel);
     }
   }
 
-  image.vkImageLayout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  image.vkImageLayout_ = finalLayout;
 
   desc.handle_ = ctx_.immediate_->submit(wrapper);
   regions_.push_back(desc);
@@ -4411,6 +4465,12 @@ lvk::Holder<lvk::TextureHandle> lvk::VulkanContext::createTexture(const TextureD
   if (desc.usage & lvk::TextureUsageBits_InputAttachment) {
     LVK_ASSERT_MSG(desc.usage & lvk::TextureUsageBits_Attachment, "Input attachments must be TextureUsageBits_Attachment");
     usageFlags |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+  }
+  if (desc.usage & lvk::TextureUsageBits_FragmentShadingRateAttachment) {
+    LVK_ASSERT_MSG(has_KHR_fragment_shading_rate_, "VK_KHR_fragment_shading_rate is not enabled");
+    LVK_ASSERT_MSG(desc.format == lvk::Format_R_UI8, "Fragment shading rate attachments must use lvk::Format_R_UI8");
+    LVK_ASSERT_MSG(desc.numSamples == 1, "Fragment shading rate attachments cannot be multisampled");
+    usageFlags |= VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
   }
 
   if (desc.storage != lvk::StorageType_Memoryless) {
@@ -5603,6 +5663,7 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
       .colorAttachments(colorBlendAttachmentStates, colorAttachmentFormats, numColorAttachments)
       .depthAttachmentFormat(formatToVkFormat(desc.depthFormat))
       .stencilAttachmentFormat(formatToVkFormat(desc.stencilFormat))
+      .fragmentShadingRateAttachment(desc.fragmentShadingRateAttachment)
       .patchControlPoints(desc.patchControlPoints)
       .build(vkDevice_, pipelineCache_, layout, &pipeline, desc.debugName);
 
@@ -6276,6 +6337,7 @@ void lvk::VulkanContext::destroy(Framebuffer& fb) {
   }
   destroyFbTexture(fb.depthStencil.texture);
   destroyFbTexture(fb.depthStencil.resolveTexture);
+  destroyFbTexture(fb.fragmentShadingRate.texture);
 }
 
 uint64_t lvk::VulkanContext::gpuAddress(AccelStructHandle handle) const {
@@ -7534,8 +7596,60 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   LVK_ASSERT_MSG(config_.vulkanVersion == VulkanVersion_1_3, "Only Vulkan 1.3 is supported on this platform");
 #endif // VK_API_VERSION_1_4
 
+  const bool fragmentShadingRateExtensionAvailable =
+      config_.enableFragmentShadingRate &&
+      hasExtension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, allDeviceExtensions);
+  if (fragmentShadingRateExtensionAvailable) {
+    fragmentShadingRateFeatures_.pNext = vkFeatures10_.pNext;
+    vkFeatures10_.pNext = &fragmentShadingRateFeatures_;
+    addNextPhysicalDeviceProperties(&fragmentShadingRateProperties_);
+  }
+
   vkGetPhysicalDeviceFeatures2(vkPhysicalDevice_, &vkFeatures10_);
   vkGetPhysicalDeviceProperties2(vkPhysicalDevice_, &vkPhysicalDeviceProperties2_);
+
+  if (fragmentShadingRateExtensionAvailable &&
+      fragmentShadingRateFeatures_.attachmentFragmentShadingRate == VK_TRUE) {
+    VkFormatProperties formatProperties = {};
+    vkGetPhysicalDeviceFormatProperties(vkPhysicalDevice_, VK_FORMAT_R8_UINT, &formatProperties);
+    if (formatProperties.optimalTilingFeatures &
+        VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) {
+      fragmentShadingRateCapabilities_.attachmentSupported = true;
+      fragmentShadingRateCapabilities_.minAttachmentTexelSize = {
+          fragmentShadingRateProperties_.minFragmentShadingRateAttachmentTexelSize.width,
+          fragmentShadingRateProperties_.minFragmentShadingRateAttachmentTexelSize.height,
+          1,
+      };
+      fragmentShadingRateCapabilities_.maxAttachmentTexelSize = {
+          fragmentShadingRateProperties_.maxFragmentShadingRateAttachmentTexelSize.width,
+          fragmentShadingRateProperties_.maxFragmentShadingRateAttachmentTexelSize.height,
+          1,
+      };
+
+      uint32_t rateCount = 0;
+      VK_ASSERT(vkGetPhysicalDeviceFragmentShadingRatesKHR(
+          vkPhysicalDevice_, &rateCount, nullptr));
+      std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(
+          rateCount,
+          VkPhysicalDeviceFragmentShadingRateKHR{
+              .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+      VK_ASSERT(vkGetPhysicalDeviceFragmentShadingRatesKHR(
+          vkPhysicalDevice_, &rateCount, rates.data()));
+      for (const VkPhysicalDeviceFragmentShadingRateKHR& rate : rates) {
+        if (!(rate.sampleCounts & VK_SAMPLE_COUNT_1_BIT) ||
+            fragmentShadingRateCapabilities_.fragmentSizeCount >=
+                FragmentShadingRateCapabilities::kMaxFragmentSizes) {
+          continue;
+        }
+        fragmentShadingRateCapabilities_
+            .fragmentSizes[fragmentShadingRateCapabilities_.fragmentSizeCount++] = {
+            rate.fragmentSize.width,
+            rate.fragmentSize.height,
+            1,
+        };
+      }
+    }
+  }
 
   const uint32_t apiVersion = vkPhysicalDeviceProperties2_.properties.apiVersion;
 
@@ -7740,6 +7854,12 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
       .presentModeFifoLatestReady = VK_TRUE,
   };
+  VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragmentShadingRateFeatures = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+      .pipelineFragmentShadingRate = VK_FALSE,
+      .primitiveFragmentShadingRate = VK_FALSE,
+      .attachmentFragmentShadingRate = VK_TRUE,
+  };
 
   auto addExtension = [&allDeviceExtensions, this, &createInfoNext](const char* name, void* features = nullptr) mutable -> void {
     if (!hasExtension(name, allDeviceExtensions)) {
@@ -7812,6 +7932,11 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   addOptionalExtension(VK_KHR_SHARED_PRESENTABLE_IMAGE_EXTENSION_NAME, has_KHR_shared_presentable_image_);
   addOptionalExtension(
       VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, has_KHR_present_mode_fifo_latest_ready_, &presentModeLatestReadyFeatures);
+  if (fragmentShadingRateCapabilities_.attachmentSupported) {
+    addOptionalExtension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME,
+                         has_KHR_fragment_shading_rate_,
+                         &fragmentShadingRateFeatures);
+  }
 
   // check extensions
   {

@@ -204,6 +204,8 @@ VkFormat lvk::formatToVkFormat(lvk::Format format) {
     return VK_FORMAT_UNDEFINED;
   case lvk::Format_R_UN8:
     return VK_FORMAT_R8_UNORM;
+  case lvk::Format_R_UI8:
+    return VK_FORMAT_R8_UINT;
   case lvk::Format_R_UN16:
     return VK_FORMAT_R16_UNORM;
   case lvk::Format_R_F16:
@@ -309,6 +311,8 @@ lvk::Format lvk::vkFormatToFormat(VkFormat format) {
     return Format_Invalid;
   case VK_FORMAT_R8_UNORM:
     return Format_R_UN8;
+  case VK_FORMAT_R8_UINT:
+    return Format_R_UI8;
   case VK_FORMAT_R16_UNORM:
     return Format_R_UN16;
   case VK_FORMAT_R16_SFLOAT:
@@ -1181,6 +1185,7 @@ VkSampleCountFlagBits lvk::getVulkanSampleCountFlags(uint32_t numSamples, VkSamp
 uint32_t lvk::getBytesPerPixel(VkFormat format) {
   switch (format) {
   case VK_FORMAT_R8_UNORM:
+  case VK_FORMAT_R8_UINT:
     return 1;
   case VK_FORMAT_R16_UNORM:
   case VK_FORMAT_R16_SFLOAT:
@@ -1331,6 +1336,11 @@ StageAccess lvk::getPipelineStageAccess(VkImageLayout layout) {
     return {
         .stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT,
+    };
+  case VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR:
+    return {
+        .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR,
+        .access = VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR,
     };
   default:
     LVK_ASSERT_MSG(false, "Unsupported image layout transition!");

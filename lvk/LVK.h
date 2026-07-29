@@ -573,6 +573,7 @@ enum Format : uint8_t {
   Format_Invalid = 0,
 
   Format_R_UN8,
+  Format_R_UI8,
   Format_R_UI16,
   Format_R_UI32,
   Format_R_UN16,
@@ -838,6 +839,7 @@ struct RenderPipelineDesc final {
   uint32_t samplesCount = 1u;
   uint32_t patchControlPoints = 0;
   float minSampleShading = 0.0f;
+  bool fragmentShadingRateAttachment = false;
 
   const char* debugName = "";
 
@@ -906,9 +908,15 @@ struct Framebuffer final {
     TextureHandle texture;
     TextureHandle resolveTexture;
   };
+  struct FragmentShadingRateAttachmentDesc {
+    TextureHandle texture;
+    uint32_t texelWidth = 1;
+    uint32_t texelHeight = 1;
+  };
 
   AttachmentDesc color[LVK_MAX_COLOR_ATTACHMENTS] = {};
   AttachmentDesc depthStencil;
+  FragmentShadingRateAttachmentDesc fragmentShadingRate;
 
   const char* debugName = "";
 
@@ -967,6 +975,7 @@ enum TextureUsageBits : uint8_t {
   TextureUsageBits_Storage = 1 << 1,
   TextureUsageBits_Attachment = 1 << 2,
   TextureUsageBits_InputAttachment = 1 << 3,
+  TextureUsageBits_FragmentShadingRateAttachment = 1 << 4,
 };
 
 enum Swizzle : uint8_t {
@@ -1292,6 +1301,26 @@ class IContext {
   // MSAA level is supported if ((samples & bitmask) != 0), where samples must be power of two.
   virtual uint32_t getFramebufferMSAABitMask() const = 0;
 
+  struct FragmentShadingRateCapabilities {
+    static constexpr uint32_t kMaxFragmentSizes = 16;
+
+    bool attachmentSupported = false;
+    Dimensions minAttachmentTexelSize = {1, 1, 1};
+    Dimensions maxAttachmentTexelSize = {1, 1, 1};
+    uint32_t fragmentSizeCount = 0;
+    Dimensions fragmentSizes[kMaxFragmentSizes] = {};
+
+    [[nodiscard]] bool supportsFragmentSize(uint32_t width, uint32_t height) const {
+      for (uint32_t i = 0; i != fragmentSizeCount; ++i) {
+        if (fragmentSizes[i].width == width && fragmentSizes[i].height == height) {
+          return true;
+        }
+      }
+      return false;
+    }
+  };
+  [[nodiscard]] virtual FragmentShadingRateCapabilities getFragmentShadingRateCapabilities() const = 0;
+
   virtual bool isExtensionEnabled(const char* ext) const = 0;
 
 #pragma region Performance queries
@@ -1352,6 +1381,7 @@ struct ContextConfig {
 
   // LVK knows about these extensions and can manage them automatically upon request
   bool enableHeadlessSurface = false; // VK_EXT_headless_surface
+  bool enableFragmentShadingRate = false; // VK_KHR_fragment_shading_rate attachment path
 
   uint64_t maxStagingBufferSize = 128ull * 1024ull * 1024ull; // a reasonable default
 };

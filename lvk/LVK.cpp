@@ -68,6 +68,7 @@ struct TextureFormatProperties {
 static constexpr TextureFormatProperties properties[] = {
     PROPS(Invalid, 1),
     PROPS(R_UN8, 1),
+    PROPS(R_UI8, 1),
     PROPS(R_UI16, 2),
     PROPS(R_UI32, 4),
     PROPS(R_UN16, 2),
