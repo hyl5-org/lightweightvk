@@ -5,7 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #define VMA_IMPLEMENTATION
@@ -2089,11 +2091,18 @@ lvk::VulkanPipelineBuilder& lvk::VulkanPipelineBuilder::stencilMasks(VkStencilFa
   return *this;
 }
 
-VkResult lvk::VulkanPipelineBuilder::build(VkDevice device,
-                                           VkPipelineCache pipelineCache,
-                                           VkPipelineLayout pipelineLayout,
-                                           VkPipeline* outPipeline,
-                                           const char* debugName) noexcept {
+VkResult lvk::VulkanPipelineBuilder::build_gpl(VulkanContext& ctx,
+                                               uint64_t layoutKey,
+                                               VkPipelineLayout pipelineLayout,
+                                               VkPipeline* outPipeline,
+                                               const char* debugName) noexcept {
+  const VkDevice device = ctx.getVkDevice();
+  const VkPipelineCache pipelineCache = ctx.pipelineCache_;
+  *outPipeline = VK_NULL_HANDLE;
+  if (!ctx.has_EXT_graphics_pipeline_library_) {
+    LLOGW("Render pipelines require VK_EXT_graphics_pipeline_library\n");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
   const VkPipelineDynamicStateCreateInfo dynamicState = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
       .dynamicStateCount = numDynamicStates_,
@@ -2150,9 +2159,45 @@ VkResult lvk::VulkanPipelineBuilder::build(VkDevice device,
 #if defined(ANDROID)
   LLOGP("vkCreateGraphicsPipelines(): %s\n", debugName);
 #endif // defined(ANDROID)
-  const VkResult result = vkCreateGraphicsPipelines(device, pipelineCache, 1, &ci, nullptr, outPipeline);
+  VkResult result = VK_SUCCESS;
+  {
+    VkPipeline libraries[4] = {};
+    uint32_t count = 0;
+    const bool mesh = std::any_of(shaderStages_, shaderStages_ + numShaderStages_, [](const VkPipelineShaderStageCreateInfo& stage) {
+      return stage.stage == VK_SHADER_STAGE_MESH_BIT_EXT;
+    });
+    if (!mesh) {
+      libraries[count++] = ctx.get_pipeline_library_vii(ci);
+    }
+    libraries[count++] = ctx.get_pipeline_library_prs(ci, layoutKey);
+    libraries[count++] = ctx.get_pipeline_library_fs(ci, layoutKey);
+    libraries[count++] = ctx.get_pipeline_library_foi(ci);
+    for (uint32_t i = 0; i != count; ++i) {
+      if (!libraries[i]) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+      }
+    }
+    const VkPipelineLibraryCreateInfoKHR linkingInfo = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+        .pNext = &renderingInfo,
+        .libraryCount = count,
+        .pLibraries = libraries,
+    };
+    const VkGraphicsPipelineCreateInfo executable = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &linkingInfo,
+        .flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT,
+        .layout = pipelineLayout,
+        .basePipelineIndex = -1,
+    };
+    LVK_PROFILER_ZONE("GPL Link", LVK_PROFILER_COLOR_CMD_DRAW);
+    result = vkCreateGraphicsPipelines(device, pipelineCache, 1, &executable, nullptr, outPipeline);
+    LVK_PROFILER_ZONE_END();
+  }
 
   if (!LVK_VERIFY(result == VK_SUCCESS)) {
+    vkDestroyPipeline(device, *outPipeline, nullptr);
+    *outPipeline = VK_NULL_HANDLE;
     return result;
   }
 
@@ -4037,7 +4082,14 @@ lvk::VulkanContext::~VulkanContext() {
   shaderModulesPool_.clear();
   texturesPool_.clear();
 
+  clearPipelineLibraries();
   waitDeferredTasks();
+
+  for (const VkPipelineLayout layout : renderPipelineLayouts_) {
+    vkDestroyPipelineLayout(vkDevice_, layout, nullptr);
+  }
+  renderPipelineLayoutCache_.clear();
+  renderPipelineLayouts_.clear();
 
   immediate_.reset(nullptr);
 
@@ -5344,9 +5396,8 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
   if (rps->lastVkDescriptorSetLayout_ != dset.vkDSL || rps->viewMask_ != viewMask) {
     deferredTask(std::packaged_task<void()>(
         [device = getVkDevice(), pipeline = rps->pipeline_]() { vkDestroyPipeline(device, pipeline, nullptr); }));
-    deferredTask(std::packaged_task<void()>(
-        [device = getVkDevice(), layout = rps->pipelineLayout_]() { vkDestroyPipelineLayout(device, layout, nullptr); }));
     rps->pipeline_ = VK_NULL_HANDLE;
+    rps->pipelineLayout_ = VK_NULL_HANDLE;
     rps->lastVkDescriptorSetLayout_ = dset.vkDSL;
     rps->viewMask_ = viewMask;
   }
@@ -5359,6 +5410,7 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
 
   VkPipelineLayout layout = VK_NULL_HANDLE;
   VkPipeline pipeline = VK_NULL_HANDLE;
+  uint64_t layoutKey = 0;
 
   const RenderPipelineDesc& desc = rps->desc_;
 
@@ -5472,15 +5524,14 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
         .pushConstantRangeCount = pushConstantsSize ? 1u : 0u,
         .pPushConstantRanges = pushConstantsSize ? &range : nullptr,
     };
-    VK_ASSERT(vkCreatePipelineLayout(vkDevice_, &ci, nullptr, &layout));
-    char pipelineLayoutName[256] = {0};
-    if (rps->desc_.debugName) {
-      snprintf(pipelineLayoutName, sizeof(pipelineLayoutName) - 1, "Pipeline Layout: %s", rps->desc_.debugName);
+    layoutKey = get_pipeline_layout_key(ci);
+    layout = getRenderPipelineLayout(ci, layoutKey, desc.debugName);
+    if (!layout) {
+      return VK_NULL_HANDLE;
     }
-    VK_ASSERT(lvk::setDebugObjectName(vkDevice_, VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)layout, pipelineLayoutName));
   }
 
-  lvk::VulkanPipelineBuilder()
+  const VkResult pipelineResult = lvk::VulkanPipelineBuilder()
       // from Vulkan 1.0
       .dynamicState(VK_DYNAMIC_STATE_VIEWPORT)
       .dynamicState(VK_DYNAMIC_STATE_SCISSOR)
@@ -5531,7 +5582,13 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
       .depthAttachmentFormat(formatToVkFormat(desc.depthFormat))
       .stencilAttachmentFormat(formatToVkFormat(desc.stencilFormat))
       .patchControlPoints(desc.patchControlPoints)
-      .build(vkDevice_, pipelineCache_, layout, &pipeline, desc.debugName);
+      .build_gpl(*this, layoutKey, layout, &pipeline, desc.debugName);
+
+  if (pipelineResult != VK_SUCCESS) {
+    vkDestroyPipeline(vkDevice_, pipeline, nullptr);
+    rps->pipelineLayout_ = VK_NULL_HANDLE;
+    return VK_NULL_HANDLE;
+  }
 
   rps->pipeline_ = pipeline;
   rps->pipelineLayout_ = layout;
@@ -5982,6 +6039,492 @@ lvk::Holder<lvk::RenderPipelineHandle> lvk::VulkanContext::createRenderPipeline(
 
   return {this, renderPipelinesPool_.create(std::move(rps))};
 }
+lvk::Holder<lvk::RenderPipelineHandle> lvk::VulkanContext::createRenderPipelineLibrary(const RenderPipelineDesc& desc, Result* outResult) {
+  const bool hasColorAttachments = desc.getNumColorAttachments() > 0;
+  const bool hasDepthAttachment = desc.depthFormat != Format_Invalid;
+  const bool hasAnyAttachments = hasColorAttachments || hasDepthAttachment;
+  if (!LVK_VERIFY(hasAnyAttachments)) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Need at least one attachment");
+    return {};
+  }
+
+  if (desc.smMesh.valid()) {
+    if (!LVK_VERIFY(!desc.vertexInput.getNumAttributes() && !desc.vertexInput.getNumInputBindings())) {
+      Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Cannot have vertexInput with mesh shaders");
+      return {};
+    }
+    if (!LVK_VERIFY(!desc.smVert.valid())) {
+      Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Cannot have both vertex and mesh shaders");
+      return {};
+    }
+    if (!LVK_VERIFY(!desc.smTesc.valid() && !desc.smTese.valid())) {
+      Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Cannot have both tessellation and mesh shaders");
+      return {};
+    }
+    if (!LVK_VERIFY(!desc.smGeom.valid())) {
+      Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Cannot have both geometry and mesh shaders");
+      return {};
+    }
+  } else {
+    if (!LVK_VERIFY(desc.smVert.valid())) {
+      Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Missing vertex shader");
+      return {};
+    }
+  }
+
+  if (!LVK_VERIFY(desc.smFrag.valid())) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Missing fragment shader");
+    return {};
+  }
+
+  RenderPipelineState rps = {.desc_ = desc};
+
+  // Adreno 840: find the spec constant whose value is a valid YUV texture index (the one that was used to index
+  // kSamplersYUV[] before array stripping)
+  if (workaround_noYcbcrSamplerArray_ && desc.specInfo.data) {
+    for (uint32_t i = 0; i != desc.specInfo.getNumSpecializationConstants(); i++) {
+      const SpecializationConstantEntry& entry = desc.specInfo.entries[i];
+      // some ad hoc guessing...
+      if (entry.size == sizeof(uint32_t) && entry.offset + sizeof(uint32_t) <= desc.specInfo.dataSize) {
+        const uint32_t value = *(const uint32_t*)((const uint8_t*)desc.specInfo.data + entry.offset);
+        if (value < texturesPool_.objects_.size() && lvk::getNumImagePlanes(texturesPool_.objects_[value].obj_.vkImageFormat_) > 1) {
+          rps.workaround_yuvTextureIndex_ = value;
+          break;
+        }
+      }
+    }
+  }
+
+  // Iterate and cache vertex input bindings and attributes
+  const lvk::VertexInput& vstate = rps.desc_.vertexInput;
+
+  bool bufferAlreadyBound[VertexInput::LVK_VERTEX_BUFFER_MAX] = {};
+
+  rps.numAttributes_ = vstate.getNumAttributes();
+
+  for (uint32_t i = 0; i != rps.numAttributes_; i++) {
+    const VertexInput::VertexAttribute& attr = vstate.attributes[i];
+
+    rps.vkAttributes_[i] = {
+        .location = attr.location, .binding = attr.binding, .format = vertexFormatToVkFormat(attr.format), .offset = (uint32_t)attr.offset};
+
+    if (!bufferAlreadyBound[attr.binding]) {
+      bufferAlreadyBound[attr.binding] = true;
+      rps.vkBindings_[rps.numBindings_++] = {
+          .binding = attr.binding,
+          .stride = vstate.inputBindings[attr.binding].stride,
+          .inputRate = vertexInputRateToVkVertexInputRate(vstate.inputBindings[attr.binding].inputRate),
+      };
+    }
+  }
+
+  if (desc.specInfo.data && desc.specInfo.dataSize) {
+    // copy into a local storage
+    rps.specConstantDataStorage_ = malloc(desc.specInfo.dataSize);
+    memcpy(rps.specConstantDataStorage_, desc.specInfo.data, desc.specInfo.dataSize);
+    rps.desc_.specInfo.data = rps.specConstantDataStorage_;
+  }
+
+  return {this, renderPipelinesPool_.create(std::move(rps))};
+}
+
+namespace {
+
+// Keys cover the state emitted by VulkanPipelineBuilder. When adding extension
+// pNext state to the builder, extend these keys as well. Never hash a whole Vulkan
+// structure: padding and pointer addresses are not pipeline state.
+struct PipelineLibraryHash {
+  uint64_t value = 14695981039346656037ull;
+
+  void bytes(const void* data, size_t size) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i != size; ++i) {
+      value = (value ^ p[i]) * 1099511628211ull;
+    }
+  }
+
+  template<typename... T>
+  void add(const T&... fields) {
+    static_assert(((std::is_arithmetic_v<T> || std::is_enum_v<T>) && ...));
+    (bytes(&fields, sizeof(fields)), ...);
+  }
+
+  // Record presence separately so an absent state cannot alias a zeroed state.
+  template<typename T>
+  const T& state(const T* p) {
+    static const T empty = {};
+    add(p != nullptr);
+    LVK_ASSERT(!p || !p->pNext);
+    return p ? *p : empty;
+  }
+};
+
+bool isLibraryDynamicState(VkDynamicState state, VkGraphicsPipelineLibraryFlagBitsEXT part) {
+  switch (state) {
+  case VK_DYNAMIC_STATE_VIEWPORT:
+  case VK_DYNAMIC_STATE_SCISSOR:
+  case VK_DYNAMIC_STATE_DEPTH_BIAS:
+  case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE:
+    return part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+  case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE:
+  case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE:
+  case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP:
+    return part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+  case VK_DYNAMIC_STATE_BLEND_CONSTANTS:
+    return part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+  default:
+    // Other states are conservatively included in all keys until partitioned.
+    return true;
+  }
+}
+
+bool hasSpecializationId(const VkShaderModuleCreateInfo& module, uint32_t id) {
+  // OpDecorate <target> SpecId <id>. LVK supplies valid inline SPIR-V via pNext.
+  for (size_t i = 5; i < module.codeSize / sizeof(uint32_t);) {
+    const uint32_t instruction = module.pCode[i];
+    const uint32_t count = instruction >> 16;
+    if (!count || i + count > module.codeSize / sizeof(uint32_t)) {
+      break;
+    }
+    if ((instruction & 0xffff) == SpvOpDecorate && count == 4 && module.pCode[i + 2] == SpvDecorationSpecId && module.pCode[i + 3] == id) {
+      return true;
+    }
+    i += count;
+  }
+  return false;
+}
+
+void hashLibraryShader(PipelineLibraryHash& hash, const VkPipelineShaderStageCreateInfo& stage) {
+  hash.add(stage.flags, stage.stage);
+  const size_t nameSize = strlen(stage.pName);
+  hash.add(nameSize);
+  hash.bytes(stage.pName, nameSize);
+  const VkShaderModuleCreateInfo* module = nullptr;
+  for (const VkBaseInStructure* next = static_cast<const VkBaseInStructure*>(stage.pNext); next; next = next->pNext) {
+    if (next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+      module = reinterpret_cast<const VkShaderModuleCreateInfo*>(next);
+    } else {
+      // VulkanPipelineBuilder currently only chains inline shader code here.
+      LVK_ASSERT_MSG(false, "Add shader pNext state to the GPL key");
+    }
+  }
+  hash.add(module != nullptr);
+  if (module) {
+    hash.add(module->flags, module->codeSize);
+    hash.bytes(module->pCode, module->codeSize);
+  } else {
+    // Native module users must invalidate these caches before recycling handles.
+    hash.add((uint64_t)stage.module);
+  }
+
+  std::vector<VkSpecializationMapEntry> entries;
+  if (stage.pSpecializationInfo) {
+    const VkSpecializationInfo& si = *stage.pSpecializationInfo;
+    for (uint32_t i = 0; i != si.mapEntryCount; ++i) {
+      const VkSpecializationMapEntry& entry = si.pMapEntries[i];
+      if (!module || hasSpecializationId(*module, entry.constantID)) {
+        entries.push_back(entry);
+      }
+    }
+    std::sort(entries.begin(), entries.end(), [](const VkSpecializationMapEntry& a, const VkSpecializationMapEntry& b) {
+      return a.constantID < b.constantID;
+    });
+    hash.add(uint32_t(entries.size()));
+    for (const VkSpecializationMapEntry& entry : entries) {
+      LVK_ASSERT(entry.offset <= si.dataSize && entry.size <= si.dataSize - entry.offset);
+      hash.add(entry.constantID, entry.size);
+      hash.bytes(static_cast<const uint8_t*>(si.pData) + entry.offset, entry.size);
+    }
+  } else {
+    hash.add(uint32_t(0));
+  }
+}
+
+void hashLibraryMultisample(PipelineLibraryHash& hash, const VkPipelineMultisampleStateCreateInfo* state) {
+  const VkPipelineMultisampleStateCreateInfo& s = hash.state(state);
+  hash.add(s.flags, s.rasterizationSamples, s.sampleShadingEnable, s.minSampleShading, s.alphaToCoverageEnable, s.alphaToOneEnable);
+  for (uint32_t i = 0; i != (uint32_t(s.rasterizationSamples) + 31) / 32; ++i) {
+    hash.add(s.pSampleMask ? s.pSampleMask[i] : ~uint32_t(0));
+  }
+}
+
+uint64_t getPipelineLibraryKey(const VkGraphicsPipelineCreateInfo& ci, VkGraphicsPipelineLibraryFlagBitsEXT part, uint64_t layoutKey = 0) {
+  PipelineLibraryHash hash;
+  hash.add(part, ci.flags);
+  if (ci.pDynamicState) {
+    LVK_ASSERT(!ci.pDynamicState->pNext);
+    hash.add(ci.pDynamicState->flags);
+    std::vector<VkDynamicState> states;
+    for (uint32_t i = 0; i != ci.pDynamicState->dynamicStateCount; ++i) {
+      if (isLibraryDynamicState(ci.pDynamicState->pDynamicStates[i], part)) {
+        states.push_back(ci.pDynamicState->pDynamicStates[i]);
+      }
+    }
+    std::sort(states.begin(), states.end());
+    hash.add(uint32_t(states.size()));
+    for (const VkDynamicState state : states) {
+      hash.add(state);
+    }
+  } else {
+    hash.add(VkPipelineDynamicStateCreateFlags(0), uint32_t(0));
+  }
+
+  if (part == VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT) {
+    const VkPipelineVertexInputStateCreateInfo& s = hash.state(ci.pVertexInputState);
+    hash.add(s.flags, s.vertexBindingDescriptionCount, s.vertexAttributeDescriptionCount);
+    for (uint32_t i = 0; i != s.vertexBindingDescriptionCount; ++i) {
+      const VkVertexInputBindingDescription& b = s.pVertexBindingDescriptions[i];
+      hash.add(b.binding, b.stride, b.inputRate);
+    }
+    for (uint32_t i = 0; i != s.vertexAttributeDescriptionCount; ++i) {
+      const VkVertexInputAttributeDescription& a = s.pVertexAttributeDescriptions[i];
+      hash.add(a.location, a.binding, a.format, a.offset);
+    }
+    const VkPipelineInputAssemblyStateCreateInfo& assembly = hash.state(ci.pInputAssemblyState);
+    hash.add(assembly.flags, assembly.topology, assembly.primitiveRestartEnable);
+    return hash.value;
+  }
+
+  hash.add((uint64_t)ci.renderPass, ci.subpass);
+  for (const VkBaseInStructure* next = static_cast<const VkBaseInStructure*>(ci.pNext); next; next = next->pNext) {
+    if (next->sType != VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+      LVK_ASSERT_MSG(false, "Add graphics pipeline pNext state to the GPL key");
+      continue;
+    }
+    const VkPipelineRenderingCreateInfo& rendering = *reinterpret_cast<const VkPipelineRenderingCreateInfo*>(next);
+    hash.add(rendering.viewMask);
+    if (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT) {
+      hash.add(rendering.colorAttachmentCount, rendering.depthAttachmentFormat, rendering.stencilAttachmentFormat);
+      for (uint32_t i = 0; i != rendering.colorAttachmentCount; ++i) {
+        hash.add(rendering.pColorAttachmentFormats[i]);
+      }
+    }
+  }
+
+  if (part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT ||
+      part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
+    hash.add(layoutKey);
+    uint32_t stageCount = 0;
+    for (uint32_t i = 0; i != ci.stageCount; ++i) {
+      const bool fragment = ci.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+      stageCount += fragment == (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT);
+    }
+    hash.add(stageCount);
+    for (uint32_t i = 0; i != ci.stageCount; ++i) {
+      const bool fragment = ci.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+      if (fragment == (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) {
+        hashLibraryShader(hash, ci.pStages[i]);
+      }
+    }
+  }
+
+  if (part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) {
+    const VkPipelineRasterizationStateCreateInfo& r = hash.state(ci.pRasterizationState);
+    hash.add(r.flags,
+             r.depthClampEnable,
+             r.rasterizerDiscardEnable,
+             r.polygonMode,
+             r.cullMode,
+             r.frontFace,
+             r.depthBiasEnable,
+             r.depthBiasConstantFactor,
+             r.depthBiasClamp,
+             r.depthBiasSlopeFactor,
+             r.lineWidth);
+    const VkPipelineViewportStateCreateInfo& s = hash.state(ci.pViewportState);
+    hash.add(s.flags, s.viewportCount, s.scissorCount, s.pViewports != nullptr, s.pScissors != nullptr);
+    for (uint32_t i = 0; s.pViewports && i != s.viewportCount; ++i) {
+      const VkViewport& v = s.pViewports[i];
+      hash.add(v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth);
+    }
+    for (uint32_t i = 0; s.pScissors && i != s.scissorCount; ++i) {
+      const VkRect2D& rect = s.pScissors[i];
+      hash.add(rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height);
+    }
+    const VkPipelineTessellationStateCreateInfo& tess = hash.state(ci.pTessellationState);
+    hash.add(tess.flags, tess.patchControlPoints);
+  } else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
+    const VkPipelineDepthStencilStateCreateInfo& s = hash.state(ci.pDepthStencilState);
+    hash.add(s.flags,
+             s.depthTestEnable,
+             s.depthWriteEnable,
+             s.depthCompareOp,
+             s.depthBoundsTestEnable,
+             s.stencilTestEnable,
+             s.minDepthBounds,
+             s.maxDepthBounds);
+    for (const VkStencilOpState& face : {s.front, s.back}) {
+      hash.add(face.failOp, face.passOp, face.depthFailOp, face.compareOp, face.compareMask, face.writeMask, face.reference);
+    }
+    // Conservative inclusion also handles sample shading and render-pass paths.
+    hashLibraryMultisample(hash, ci.pMultisampleState);
+  } else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT) {
+    hashLibraryMultisample(hash, ci.pMultisampleState);
+    const VkPipelineColorBlendStateCreateInfo& s = hash.state(ci.pColorBlendState);
+    hash.add(s.flags, s.logicOpEnable, s.logicOp, s.attachmentCount);
+    for (const float constant : s.blendConstants) {
+      hash.add(constant);
+    }
+    for (uint32_t i = 0; i != s.attachmentCount; ++i) {
+      const VkPipelineColorBlendAttachmentState& a = s.pAttachments[i];
+      hash.add(a.blendEnable,
+               a.srcColorBlendFactor,
+               a.dstColorBlendFactor,
+               a.colorBlendOp,
+               a.srcAlphaBlendFactor,
+               a.dstAlphaBlendFactor,
+               a.alphaBlendOp,
+               a.colorWriteMask);
+    }
+  }
+  return hash.value;
+}
+
+VkPipeline findPipelineLibrary(VkDevice device,
+                               VkPipelineCache pipelineCache,
+                               std::unordered_map<uint64_t, VkPipeline>& cache,
+                               const VkGraphicsPipelineCreateInfo& ci,
+                               VkGraphicsPipelineLibraryFlagBitsEXT part,
+                               uint64_t layoutKey = 0) {
+  const uint64_t key = getPipelineLibraryKey(ci, part, layoutKey);
+  const std::unordered_map<uint64_t, VkPipeline>::const_iterator it = cache.find(key);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  VkGraphicsPipelineLibraryCreateInfoEXT library_info{};
+  library_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT;
+  library_info.pNext = ci.pNext;
+  library_info.flags = part;
+
+  VkGraphicsPipelineCreateInfo pipeline_library_create_info{};
+  pipeline_library_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  pipeline_library_create_info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+  pipeline_library_create_info.pNext = &library_info;
+  pipeline_library_create_info.pDynamicState = ci.pDynamicState;
+  pipeline_library_create_info.renderPass = ci.renderPass;
+  pipeline_library_create_info.subpass = ci.subpass;
+  pipeline_library_create_info.basePipelineIndex = -1;
+
+  // Keep the selected stage array alive until vkCreateGraphicsPipelines() returns.
+  std::vector<VkPipelineShaderStageCreateInfo> stages;
+  if (part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT ||
+      part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
+    for (uint32_t i = 0; i != ci.stageCount; ++i) {
+      const bool fragment = ci.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+      if (fragment == (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) {
+        stages.push_back(ci.pStages[i]);
+        // Use no specialization info when there are no entries.
+        if (stages.back().pSpecializationInfo && !stages.back().pSpecializationInfo->mapEntryCount) {
+          stages.back().pSpecializationInfo = nullptr;
+        }
+      }
+    }
+    if (part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT && stages.empty()) {
+      return VK_NULL_HANDLE;
+    }
+    pipeline_library_create_info.pStages = stages.data();
+    pipeline_library_create_info.stageCount = uint32_t(stages.size());
+    pipeline_library_create_info.layout = ci.layout;
+  }
+
+  if (part == VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT) {
+    pipeline_library_create_info.pVertexInputState = ci.pVertexInputState;
+    pipeline_library_create_info.pInputAssemblyState = ci.pInputAssemblyState;
+  } else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) {
+    pipeline_library_create_info.pRasterizationState = ci.pRasterizationState;
+    pipeline_library_create_info.pViewportState = ci.pViewportState;
+    pipeline_library_create_info.pTessellationState = ci.pTessellationState;
+  } else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
+    pipeline_library_create_info.pDepthStencilState = ci.pDepthStencilState;
+    pipeline_library_create_info.pMultisampleState = ci.pMultisampleState;
+
+  } else if (part == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT) {
+    pipeline_library_create_info.pColorBlendState = ci.pColorBlendState;
+    pipeline_library_create_info.pMultisampleState = ci.pMultisampleState;
+  } else {
+    LVK_ASSERT(false);
+    return VK_NULL_HANDLE;
+  }
+
+  VkPipeline out = VK_NULL_HANDLE;
+  VkResult result;
+  LVK_PROFILER_ZONE("GPL Library Compile", LVK_PROFILER_COLOR_CMD_DRAW);
+  result = vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipeline_library_create_info, nullptr, &out);
+  LVK_PROFILER_ZONE_END();
+  if (result != VK_SUCCESS) {
+    LLOGW("GPL library creation failed (part %u, VkResult %d)\n", uint32_t(part), int(result));
+    vkDestroyPipeline(device, out, nullptr);
+    return VK_NULL_HANDLE;
+  }
+  cache.emplace(key, out);
+  return out;
+}
+
+} // namespace
+
+uint64_t lvk::VulkanContext::get_pipeline_layout_key(const VkPipelineLayoutCreateInfo& ci) {
+  LVK_ASSERT(!ci.pNext);
+  PipelineLibraryHash hash;
+  hash.add(ci.flags, ci.setLayoutCount, ci.pushConstantRangeCount);
+  // LVK reuses descriptor set layout handles across PSOs. Clear library caches
+  // before recycling these handles; unlike VkPipelineLayout they are stable here.
+  for (uint32_t i = 0; i != ci.setLayoutCount; ++i) {
+    hash.add((uint64_t)ci.pSetLayouts[i]);
+  }
+  for (uint32_t i = 0; i != ci.pushConstantRangeCount; ++i) {
+    const VkPushConstantRange& range = ci.pPushConstantRanges[i];
+    hash.add(range.stageFlags, range.offset, range.size);
+  }
+  return hash.value;
+}
+
+VkPipeline lvk::VulkanContext::get_pipeline_library_vii(const VkGraphicsPipelineCreateInfo& ci) {
+  return findPipelineLibrary(vkDevice_, pipelineCache_, viiPool_, ci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT);
+}
+
+VkPipeline lvk::VulkanContext::get_pipeline_library_prs(const VkGraphicsPipelineCreateInfo& ci, uint64_t layoutKey) {
+  return findPipelineLibrary(
+      vkDevice_, pipelineCache_, prsPool_, ci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, layoutKey);
+}
+
+VkPipeline lvk::VulkanContext::get_pipeline_library_fs(const VkGraphicsPipelineCreateInfo& ci, uint64_t layoutKey) {
+  return findPipelineLibrary(vkDevice_, pipelineCache_, fsPool_, ci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, layoutKey);
+}
+
+VkPipeline lvk::VulkanContext::get_pipeline_library_foi(const VkGraphicsPipelineCreateInfo& ci) {
+  return findPipelineLibrary(vkDevice_, pipelineCache_, foiPool_, ci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
+}
+
+VkPipelineLayout lvk::VulkanContext::getRenderPipelineLayout(const VkPipelineLayoutCreateInfo& ci,
+                                                            uint64_t key,
+                                                            const char* debugName) {
+  const std::unordered_map<uint64_t, VkPipelineLayout>::const_iterator it = renderPipelineLayoutCache_.find(key);
+  if (it != renderPipelineLayoutCache_.end()) {
+    return it->second;
+  }
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  const VkResult result = vkCreatePipelineLayout(vkDevice_, &ci, nullptr, &layout);
+  if (result != VK_SUCCESS) {
+    LLOGW("Render pipeline layout creation failed (VkResult %d)\n", int(result));
+    return VK_NULL_HANDLE;
+  }
+  renderPipelineLayouts_.push_back(layout);
+  renderPipelineLayoutCache_.emplace(key, layout);
+  char name[256] = {};
+  snprintf(name, sizeof(name), "Shared Render Pipeline Layout: %s", debugName ? debugName : "");
+  VK_ASSERT(lvk::setDebugObjectName(vkDevice_, VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)layout, name));
+  return layout;
+}
+
+void lvk::VulkanContext::clearPipelineLibraries() {
+  for (std::unordered_map<uint64_t, VkPipeline>* cache : {&viiPool_, &prsPool_, &fsPool_, &foiPool_}) {
+    for (const std::pair<const uint64_t, VkPipeline>& entry : *cache) {
+      deferredTask(
+          std::packaged_task<void()>([device = vkDevice_, pipeline = entry.second]() { vkDestroyPipeline(device, pipeline, nullptr); }));
+    }
+    cache->clear();
+  }
+}
 
 void lvk::VulkanContext::destroy(lvk::RayTracingPipelineHandle handle) {
   lvk::RayTracingPipelineState* rtps = rayTracingPipelinesPool_.get(handle);
@@ -6028,8 +6571,6 @@ void lvk::VulkanContext::destroy(lvk::RenderPipelineHandle handle) {
 
   deferredTask(
       std::packaged_task<void()>([device = getVkDevice(), pipeline = rps->pipeline_]() { vkDestroyPipeline(device, pipeline, nullptr); }));
-  deferredTask(std::packaged_task<void()>(
-      [device = getVkDevice(), layout = rps->pipelineLayout_]() { vkDestroyPipelineLayout(device, layout, nullptr); }));
 
   renderPipelinesPool_.destroy(handle);
 }
@@ -7562,6 +8103,17 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
       .taskShader = VK_TRUE,
       .meshShader = VK_TRUE,
   };
+  VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphicsPipelineLibraryFeatures = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+  };
+  if (hasExtension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, allDeviceExtensions) &&
+      hasExtension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, allDeviceExtensions)) {
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &graphicsPipelineLibraryFeatures,
+    };
+    vkGetPhysicalDeviceFeatures2(vkPhysicalDevice_, &features);
+  }
   VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR presentModeLatestReadyFeatures = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
       .presentModeFifoLatestReady = VK_TRUE,
@@ -7634,6 +8186,12 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   addOptionalExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, has_EXT_device_fault_, &deviceFaultFeatures);
   addOptionalExtension(VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME, has_EXT_shader_tile_image, &shaderTileImageFeatures);
   addOptionalExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME, has_EXT_mesh_shader_, &meshShaderFeatures);
+  if (graphicsPipelineLibraryFeatures.graphicsPipelineLibrary) {
+    addOptionalExtensions(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
+                          VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
+                          has_EXT_graphics_pipeline_library_,
+                          &graphicsPipelineLibraryFeatures);
+  }
   addOptionalExtension(VK_KHR_SHARED_PRESENTABLE_IMAGE_EXTENSION_NAME, has_KHR_shared_presentable_image_);
   addOptionalExtension(
       VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, has_KHR_present_mode_fifo_latest_ready_, &presentModeLatestReadyFeatures);
@@ -8030,6 +8588,10 @@ lvk::Result lvk::VulkanContext::growDescriptorPool(VulkanContext::DescriptorSet&
   }
 
   if (dset.vkDSL != VK_NULL_HANDLE) {
+    // Library layout keys contain descriptor layout handles; retire before reuse.
+    clearPipelineLibraries();
+    // Old layouts remain owned until shutdown; cached lookup must not reuse a recycled DSL handle.
+    renderPipelineLayoutCache_.clear();
     deferredTask(
         std::packaged_task<void()>([device = vkDevice_, dsl = dset.vkDSL]() { vkDestroyDescriptorSetLayout(device, dsl, nullptr); }));
   }

@@ -1232,6 +1232,7 @@ class IContext {
   [[nodiscard]] virtual Holder<ComputePipelineHandle> createComputePipeline(const ComputePipelineDesc& desc,
                                                                             Result* outResult = nullptr) = 0;
   [[nodiscard]] virtual Holder<RenderPipelineHandle> createRenderPipeline(const RenderPipelineDesc& desc, Result* outResult = nullptr) = 0;
+  [[nodiscard]] virtual Holder<RenderPipelineHandle> createRenderPipelineLibrary(const RenderPipelineDesc& desc, Result* outResult = nullptr) = 0;
   [[nodiscard]] virtual Holder<RayTracingPipelineHandle> createRayTracingPipeline(const RayTracingPipelineDesc& desc,
                                                                                   Result* outResult = nullptr) = 0;
   [[nodiscard]] virtual Holder<ShaderModuleHandle> createShaderModule(const ShaderModuleDesc& desc, Result* outResult = nullptr) = 0;

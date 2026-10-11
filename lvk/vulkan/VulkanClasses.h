@@ -12,11 +12,21 @@
 
 #include <future>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace lvk {
 
 class VulkanContext;
+
+struct VertexInputLibrary;
+struct PreRasterLibrary;
+struct FragmentShaderLibrary;
+struct FragmentOutputLibrary;
+
+struct PipelineLibraryState {
+  VkPipeline pipeline = VK_NULL_HANDLE;
+};
 
 struct DeviceQueues final {
   const static uint32_t INVALID = 0xFFFFFFFF;
@@ -239,6 +249,7 @@ struct RenderPipelineState final {
   VkDescriptorSetLayout lastVkDescriptorSetLayout_ = VK_NULL_HANDLE;
 
   VkShaderStageFlags shaderStageFlags_ = 0;
+  // Non-owning: shared render pipeline layouts are owned by VulkanContext.
   VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline pipeline_ = VK_NULL_HANDLE;
 
@@ -246,6 +257,8 @@ struct RenderPipelineState final {
 
   uint32_t viewMask_ = 0;
 };
+
+
 
 class VulkanPipelineBuilder final {
  public:
@@ -274,8 +287,8 @@ class VulkanPipelineBuilder final {
   VulkanPipelineBuilder& stencilAttachmentFormat(VkFormat format);
   VulkanPipelineBuilder& patchControlPoints(uint32_t numPoints);
 
-  VkResult build(VkDevice device,
-                 VkPipelineCache pipelineCache,
+  VkResult build_gpl(VulkanContext& ctx,
+                 uint64_t layoutKey,
                  VkPipelineLayout pipelineLayout,
                  VkPipeline* outPipeline,
                  const char* debugName = nullptr) noexcept;
@@ -558,6 +571,7 @@ class VulkanContext final : public IContext {
 
   Holder<ComputePipelineHandle> createComputePipeline(const ComputePipelineDesc& desc, Result* outResult) override;
   Holder<RenderPipelineHandle> createRenderPipeline(const RenderPipelineDesc& desc, Result* outResult) override;
+  Holder<RenderPipelineHandle> createRenderPipelineLibrary(const RenderPipelineDesc& desc, Result* outResult) override;
   Holder<RayTracingPipelineHandle> createRayTracingPipeline(const RayTracingPipelineDesc& desc, Result* outResult = nullptr) override;
   Holder<ShaderModuleHandle> createShaderModule(const ShaderModuleDesc& desc, Result* outResult) override;
 
@@ -653,6 +667,13 @@ class VulkanContext final : public IContext {
 
   std::vector<uint8_t> getPipelineCacheData() const;
 
+  // Hash the layout definition, not the per-PSO VkPipelineLayout handle.
+  static uint64_t get_pipeline_layout_key(const VkPipelineLayoutCreateInfo& ci);
+  VkPipeline get_pipeline_library_vii(const VkGraphicsPipelineCreateInfo& ci);
+  VkPipeline get_pipeline_library_prs(const VkGraphicsPipelineCreateInfo& ci, uint64_t layoutKey);
+  VkPipeline get_pipeline_library_fs(const VkGraphicsPipelineCreateInfo& ci, uint64_t layoutKey);
+  VkPipeline get_pipeline_library_foi(const VkGraphicsPipelineCreateInfo& ci);
+
   // execute a task some time in the future after the submit handle finished processing
   void deferredTask(std::packaged_task<void()>&& task, SubmitHandle handle = SubmitHandle()) const;
 
@@ -680,6 +701,8 @@ class VulkanContext final : public IContext {
   void querySurfaceCapabilities();
   void processDeferredTasks() const;
   void waitDeferredTasks();
+  void clearPipelineLibraries();
+  VkPipelineLayout getRenderPipelineLayout(const VkPipelineLayoutCreateInfo& ci, uint64_t key, const char* debugName);
   void generateMipmap(TextureHandle handle) const;
   lvk::Result growDescriptorPool(VulkanContext::DescriptorSet& dset, uint32_t maxTextures, uint32_t maxSamplers, uint32_t maxAccelStructs);
   ShaderModuleState createShaderModuleFromSPIRV(const void* spirv, size_t numBytes, const char* debugName, Result* outResult) const;
@@ -799,6 +822,7 @@ class VulkanContext final : public IContext {
   bool has_EXT_device_fault_ = false;
   bool has_EXT_shader_tile_image = false;
   bool has_EXT_mesh_shader_ = false;
+  bool has_EXT_graphics_pipeline_library_ = false;
   bool has_MVK_macos_surface_ = false;
   bool has_KHR_shared_presentable_image_ = false;
   bool has_KHR_present_mode_fifo_latest_ready_ = false;
@@ -809,6 +833,19 @@ class VulkanContext final : public IContext {
 
   lvk::Pool<lvk::ShaderModule, lvk::ShaderModuleState> shaderModulesPool_;
   lvk::Pool<lvk::RenderPipeline, lvk::RenderPipelineState> renderPipelinesPool_;
+
+  std::unordered_map<uint64_t, VkPipeline> viiPool_;
+  std::unordered_map<uint64_t, VkPipeline> prsPool_;
+  std::unordered_map<uint64_t, VkPipeline> fsPool_;
+  std::unordered_map<uint64_t, VkPipeline> foiPool_;
+  std::unordered_map<uint64_t, VkPipelineLayout> renderPipelineLayoutCache_;
+  // Keep layouts alive for existing PSOs/command buffers even after cache invalidation.
+  std::vector<VkPipelineLayout> renderPipelineLayouts_;
+  //lvk::Pool<lvk::VertexInputLibrary, lvk::PipelineLibraryState> viiPool_;
+  //lvk::Pool<lvk::PreRasterLibrary, lvk::PipelineLibraryState> prsPool_;
+  //lvk::Pool<lvk::FragmentShaderLibrary, lvk::PipelineLibraryState> fsPool_;
+  //lvk::Pool<lvk::FragmentOutputLibrary, lvk::PipelineLibraryState> foiPool_;
+
   lvk::Pool<lvk::ComputePipeline, lvk::ComputePipelineState> computePipelinesPool_;
   lvk::Pool<lvk::RayTracingPipeline, lvk::RayTracingPipelineState> rayTracingPipelinesPool_;
   lvk::Pool<lvk::Sampler, VkSampler> samplersPool_;
