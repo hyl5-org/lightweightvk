@@ -2253,6 +2253,7 @@ void lvk::CommandBuffer::cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle
     return;
   }
 
+  currentShaderLayout_ = VK_NULL_HANDLE;
   currentPipelineGraphics_ = {};
   currentPipelineCompute_ = {};
   currentPipelineRayTracing_ = handle;
@@ -2279,6 +2280,7 @@ void lvk::CommandBuffer::cmdBindComputePipeline(lvk::ComputePipelineHandle handl
     return;
   }
 
+  currentShaderLayout_ = VK_NULL_HANDLE;
   currentPipelineGraphics_ = {};
   currentPipelineCompute_ = handle;
   currentPipelineRayTracing_ = {};
@@ -2297,6 +2299,161 @@ void lvk::CommandBuffer::cmdBindComputePipeline(lvk::ComputePipelineHandle handl
     ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE, cps->pipelineLayout_);
   }
 }
+
+void lvk::CommandBuffer::cmdBindShaderEXT(VkShaderStageFlagBits stage, VkShaderEXT shader) {
+  cmdBindShadersEXT(1, &stage, &shader);
+}
+
+void lvk::CommandBuffer::cmdSetVertexInput(const VertexInput& input) {
+  if (!LVK_VERIFY(ctx_->has_EXT_shader_object_)) return;
+  const VkCommandBuffer cmd = wrapper_->cmdBuf_;
+  VkVertexInputBindingDescription2EXT bindings[VertexInput::LVK_VERTEX_BUFFER_MAX] = {};
+  VkVertexInputAttributeDescription2EXT attributes[VertexInput::LVK_VERTEX_ATTRIBUTES_MAX] = {};
+  bool bound[VertexInput::LVK_VERTEX_BUFFER_MAX] = {};
+  uint32_t numBindings = 0;
+  const uint32_t numAttributes = input.getNumAttributes();
+  for (uint32_t i = 0; i != numAttributes; ++i) {
+    const VertexInput::VertexAttribute& attribute = input.attributes[i];
+    attributes[i] = {.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                     .location = attribute.location, .binding = attribute.binding,
+                     .format = vertexFormatToVkFormat(attribute.format), .offset = (uint32_t)attribute.offset};
+    if (!bound[attribute.binding]) {
+      bound[attribute.binding] = true;
+      const VertexInput::VertexInputBinding& binding = input.inputBindings[attribute.binding];
+      bindings[numBindings++] = {.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+                                 .binding = attribute.binding, .stride = binding.stride,
+                                 .inputRate = vertexInputRateToVkVertexInputRate(binding.inputRate), .divisor = 1};
+    }
+  }
+  vkCmdSetVertexInputEXT(cmd, numBindings, bindings, numAttributes, attributes);
+}
+
+void lvk::CommandBuffer::cmdSetCullMode(CullMode mode) {
+  vkCmdSetCullMode(wrapper_->cmdBuf_, cullModeToVkCullMode(mode));
+}
+
+void lvk::CommandBuffer::cmdSetShaderObjectDefaults() {
+  if (!LVK_VERIFY(isRendering_ && ctx_->has_EXT_shader_object_)) return;
+  const VkCommandBuffer cmd = wrapper_->cmdBuf_;
+  VkShaderStageFlagBits stages[5] = {};
+  uint32_t count = 0;
+  if (ctx_->vkFeatures10_.features.tessellationShader) {
+    stages[count++] = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    stages[count++] = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+  }
+  if (ctx_->vkFeatures10_.features.geometryShader) {
+    stages[count++] = VK_SHADER_STAGE_GEOMETRY_BIT;
+  }
+  if (ctx_->has_EXT_mesh_shader_) {
+    stages[count++] = VK_SHADER_STAGE_TASK_BIT_EXT;
+    stages[count++] = VK_SHADER_STAGE_MESH_BIT_EXT;
+  }
+  // Unused stages must explicitly be unbound, including after a mesh pipeline.
+  if (count) vkCmdBindShadersEXT(cmd, count, stages, nullptr);
+  lastPipelineBound_ = VK_NULL_HANDLE;
+  vkCmdSetPrimitiveTopology(cmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+  vkCmdSetPrimitiveRestartEnable(cmd, VK_FALSE);
+  // Re-emit these after a static pipeline binding, which can invalidate their counts.
+  vkCmdSetViewportWithCount(cmd, 1, &shaderViewport_);
+  vkCmdSetScissorWithCount(cmd, 1, &shaderScissor_);
+  vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
+  vkCmdSetPolygonModeEXT(cmd, VK_POLYGON_MODE_FILL);
+  vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);
+  vkCmdSetFrontFace(cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+  vkCmdSetDepthClampEnableEXT(cmd, VK_FALSE);
+  vkCmdSetLineWidth(cmd, 1.0f);
+  const TextureHandle attachment = framebuffer_.color[0].texture ? framebuffer_.color[0].texture : framebuffer_.depthStencil.texture;
+  const VkSampleCountFlagBits samples = attachment ? ctx_->texturesPool_.get(attachment)->vkSamples_ : VK_SAMPLE_COUNT_1_BIT;
+  const VkSampleMask sampleMask[2] = {~0u, ~0u};
+  vkCmdSetRasterizationSamplesEXT(cmd, samples);
+  vkCmdSetSampleMaskEXT(cmd, samples, sampleMask);
+  vkCmdSetAlphaToCoverageEnableEXT(cmd, VK_FALSE);
+  vkCmdSetAlphaToOneEnableEXT(cmd, VK_FALSE);
+  vkCmdSetLogicOpEnableEXT(cmd, VK_FALSE);
+  vkCmdSetDepthBoundsTestEnable(cmd, VK_FALSE);
+  vkCmdSetStencilTestEnable(cmd, VK_FALSE);
+  const float blendConstants[4] = {};
+  vkCmdSetBlendConstants(cmd, blendConstants);
+  for (uint32_t i = 0; i != framebuffer_.getNumColorAttachments(); ++i) {
+    const ColorAttachment attachment = {};
+    const VkBool32 blendEnabled = attachment.blendEnabled;
+    const VkColorBlendEquationEXT blend = {
+        .srcColorBlendFactor = blendFactorToVkBlendFactor(attachment.srcRGBBlendFactor),
+        .dstColorBlendFactor = blendFactorToVkBlendFactor(attachment.dstRGBBlendFactor),
+        .colorBlendOp = blendOpToVkBlendOp(attachment.rgbBlendOp),
+        .srcAlphaBlendFactor = blendFactorToVkBlendFactor(attachment.srcAlphaBlendFactor),
+        .dstAlphaBlendFactor = blendFactorToVkBlendFactor(attachment.dstAlphaBlendFactor),
+        .alphaBlendOp = blendOpToVkBlendOp(attachment.alphaBlendOp),
+    };
+    const VkColorComponentFlags writeMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    vkCmdSetColorBlendEnableEXT(cmd, i, 1, &blendEnabled);
+    vkCmdSetColorBlendEquationEXT(cmd, i, 1, &blend);
+    vkCmdSetColorWriteMaskEXT(cmd, i, 1, &writeMask);
+  }
+}
+
+void lvk::CommandBuffer::cmdBindShadersEXT(uint32_t stageCount, const VkShaderStageFlagBits* stages, const VkShaderEXT* shaders) {
+  LVK_PROFILER_FUNCTION();
+  if (!LVK_VERIFY(ctx_->has_EXT_shader_object_ && vkCmdBindShadersEXT && stageCount && stages)) {
+    return;
+  }
+  ctx_->checkAndUpdateDescriptorSets();
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkShaderStageFlags stageMask = 0;
+  VkShaderStageFlags activeMask = 0;
+  constexpr VkShaderStageFlags supportedStages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT |
+                                                VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+  for (uint32_t i = 0; i < stageCount; ++i) {
+    const VkShaderStageFlags stage = stages[i];
+    if (!LVK_VERIFY(stage && !(stage & (stage - 1)) && !(stage & ~supportedStages) && !(stageMask & stage))) {
+      return;
+    }
+    stageMask |= stage;
+    if (!shaders || !shaders[i]) {
+      continue;
+    }
+    const std::unordered_map<VkShaderEXT, ShaderObjectState>::const_iterator it = ctx_->shaderObjects_.find(shaders[i]);
+    if (!LVK_VERIFY(it != ctx_->shaderObjects_.end() && it->second.stage == stages[i])) {
+      return;
+    }
+    const ShaderObjectState& state = it->second;
+    if (!LVK_VERIFY(state.descriptorLayoutKey == ctx_->DSets_[ctx_->lastUpdatedDSet_].layoutCompatibilityKey)) {
+      LLOGW("Recreate shader objects after the bindless descriptor layout changes\n");
+      return;
+    }
+    // All shader objects share the same push-constant range. Identically defined
+    // descriptor layouts are compatible even when their native handles differ.
+    layout = state.layout;
+    activeMask |= stage;
+  }
+  if (!LVK_VERIFY(!(activeMask & VK_SHADER_STAGE_VERTEX_BIT) ||
+                 !(activeMask & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)))) {
+    return;
+  }
+
+  vkCmdBindShadersEXT(wrapper_->cmdBuf_, stageCount, stages, shaders);
+  // Binding shaders invalidates the relevant native pipeline binding. Invalidate
+  // the LVK cache as well so rebinding that same pipeline emits vkCmdBindPipeline().
+  lastPipelineBound_ = VK_NULL_HANDLE;
+  currentPipelineGraphics_ = {};
+  currentPipelineCompute_ = {};
+  currentPipelineRayTracing_ = {};
+  if (layout) {
+    currentShaderLayout_ = layout;
+    if (activeMask & VK_SHADER_STAGE_COMPUTE_BIT) {
+      ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE, layout);
+    }
+    if (activeMask & ~VK_SHADER_STAGE_COMPUTE_BIT) {
+      ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
+      if (inputAttachments_.count) {
+        vkCmdPushDescriptorSetKHR(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                                 kDescriptorSet_InputAttachments, inputAttachments_.count, inputAttachments_.writes);
+      }
+    }
+  }
+}
+
 
 void lvk::CommandBuffer::cmdDispatchThreadGroups(const Dimensions& threadgroupCount, const Dependencies& deps) {
   LVK_PROFILER_FUNCTION();
@@ -2702,6 +2859,10 @@ void lvk::CommandBuffer::cmdBindViewport(const Viewport& viewport) {
       .maxDepth = viewport.maxDepth, // float maxDepth;
   };
   vkCmdSetViewport(wrapper_->cmdBuf_, 0, 1, &vp);
+  shaderViewport_ = vp;
+  if (currentShaderLayout_) {
+    vkCmdSetViewportWithCount(wrapper_->cmdBuf_, 1, &vp);
+  }
 }
 
 void lvk::CommandBuffer::cmdBindScissorRect(const ScissorRect& rect) {
@@ -2710,6 +2871,10 @@ void lvk::CommandBuffer::cmdBindScissorRect(const ScissorRect& rect) {
       VkExtent2D{rect.width, rect.height},
   };
   vkCmdSetScissor(wrapper_->cmdBuf_, 0, 1, &scissor);
+  shaderScissor_ = scissor;
+  if (currentShaderLayout_) {
+    vkCmdSetScissorWithCount(wrapper_->cmdBuf_, 1, &scissor);
+  }
 }
 
 void lvk::CommandBuffer::cmdBindRenderPipeline(lvk::RenderPipelineHandle handle) {
@@ -2717,6 +2882,7 @@ void lvk::CommandBuffer::cmdBindRenderPipeline(lvk::RenderPipelineHandle handle)
     return;
   }
 
+  currentShaderLayout_ = VK_NULL_HANDLE;
   currentPipelineGraphics_ = handle;
   currentPipelineCompute_ = {};
   currentPipelineRayTracing_ = {};
@@ -2804,6 +2970,11 @@ void lvk::CommandBuffer::cmdPushConstants(const void* data, size_t size, size_t 
     LLOGW("Push constants size exceeded %u (max %u bytes)", size + offset, limits.maxPushConstantsSize);
   }
 
+  if (currentShaderLayout_) {
+    vkCmdPushConstants(wrapper_->cmdBuf_, currentShaderLayout_, VK_SHADER_STAGE_ALL, (uint32_t)offset, (uint32_t)size, data);
+    return;
+  }
+
   if (currentPipelineGraphics_.empty() && currentPipelineCompute_.empty() && currentPipelineRayTracing_.empty()) {
     LVK_ASSERT_MSG(false, "No pipeline bound - cannot set push constants");
     return;
@@ -2838,9 +3009,9 @@ void lvk::CommandBuffer::cmdFillBuffer(BufferHandle buffer, size_t bufferOffset,
 
   VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
 
-  // if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
-  //   dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  // }
+  if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+    dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  }
   if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) {
     dstStage |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
   }
@@ -2926,9 +3097,9 @@ void lvk::CommandBuffer::cmdUpdateBuffer(BufferHandle buffer, size_t bufferOffse
 
   VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
 
-  // if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
-  //   dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  // }
+  if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+    dstStage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  }
   if (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) {
     dstStage |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
   }
@@ -4083,6 +4254,9 @@ lvk::VulkanContext::~VulkanContext() {
   texturesPool_.clear();
 
   clearPipelineLibraries();
+  while (!shaderObjects_.empty()) {
+    destroyShader(shaderObjects_.begin()->first);
+  }
   waitDeferredTasks();
 
   for (const VkPipelineLayout layout : renderPipelineLayouts_) {
@@ -6989,20 +7163,197 @@ lvk::Holder<lvk::ShaderModuleHandle> lvk::VulkanContext::createShaderModule(cons
   return {this, shaderModulesPool_.create(std::move(sm))};
 }
 
+VkShaderEXT lvk::VulkanContext::createShader(const ShaderDesc& desc, Result* outResult) {
+  if (!has_EXT_shader_object_ || !vkCreateShadersEXT || !vkDestroyShaderEXT) {
+    Result::setResult(outResult, Result::Code::RuntimeError, "VK_EXT_shader_object is not enabled");
+    return VK_NULL_HANDLE;
+  }
+  Result result;
+  ShaderState state = desc.dataSize ? createShaderFromSPIRV(desc.data, desc.dataSize, desc.debugName, &result)
+                     : desc.entryPointName
+                         ? createShaderFromSlang(desc.stage, desc.data, desc.entryPointName, desc.debugName, &result)
+                         : createShaderFromGLSL(desc.stage, desc.data, desc.debugName, &result);
+  if (!result.isOk()) {
+    Result::setResult(outResult, result);
+    return VK_NULL_HANDLE;
+  }
+  if (state.ci.stage != shaderStageToVkShaderStage(desc.stage)) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "SPIR-V stage does not match the shader description");
+    return VK_NULL_HANDLE;
+  }
+  const uint32_t maxSize = getVkPhysicalDeviceProperties().limits.maxPushConstantsSize;
+  if (state.pushConstantsSize > maxSize) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Shader push constants exceed the device limit");
+    return VK_NULL_HANDLE;
+  }
+  checkAndUpdateDescriptorSets();
+  const VkDescriptorSetLayout dsl = DSets_[lastUpdatedDSet_].vkDSL;
+  const VkDescriptorSetLayout dsls[] = {dsl, dsl, dsl, dsl, dslInputAttachments_};
+  // Independently created shaders share one range, including shaders using no push constants.
+  const VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_ALL, .offset = 0, .size = maxSize};
+  const VkPipelineLayoutCreateInfo layout = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = (uint32_t)LVK_ARRAY_NUM_ELEMENTS(dsls),
+      .pSetLayouts = dsls,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &range,
+  };
+  const VkPipelineLayout pipelineLayout = getRenderPipelineLayout(layout, get_pipeline_layout_key(layout), "Shader object layout");
+  if (!pipelineLayout) {
+    Result::setResult(outResult, Result::Code::RuntimeError, "Failed to create shader object layout");
+    return VK_NULL_HANDLE;
+  }
+  VkSpecializationMapEntry entries[SpecializationConstantDesc::LVK_SPECIALIZATION_CONSTANTS_MAX] = {};
+  const VkSpecializationInfo specInfo = lvk::getPipelineShaderStageSpecializationInfo(desc.specInfo, entries);
+  state.ci.setLayoutCount = layout.setLayoutCount;
+  state.ci.pSetLayouts = layout.pSetLayouts;
+  state.ci.pushConstantRangeCount = layout.pushConstantRangeCount;
+  state.ci.pPushConstantRanges = layout.pPushConstantRanges;
+  state.ci.pSpecializationInfo = specInfo.mapEntryCount ? &specInfo : nullptr;
+  VkShaderEXT shader = VK_NULL_HANDLE;
+  VkResult vkResult;
+  LVK_PROFILER_ZONE("Shader Object Compile", LVK_PROFILER_COLOR_CREATE);
+  vkResult = vkCreateShadersEXT(vkDevice_, 1, &state.ci, nullptr, &shader);
+  LVK_PROFILER_ZONE_END();
+  if (vkResult != VK_SUCCESS) {
+    if (shader) {
+      vkDestroyShaderEXT(vkDevice_, shader, nullptr);
+    }
+    LLOGW("vkCreateShadersEXT() failed: %d\n", vkResult);
+    Result::setResult(outResult, Result::Code::RuntimeError, "vkCreateShadersEXT() failed");
+    return VK_NULL_HANDLE;
+  }
+  shaderObjects_.emplace(shader, ShaderObjectState{pipelineLayout, dsl, state.ci.stage,
+                                                 DSets_[lastUpdatedDSet_].layoutCompatibilityKey});
+  if (desc.debugName && *desc.debugName) {
+    VK_ASSERT(lvk::setDebugObjectName(vkDevice_, VK_OBJECT_TYPE_SHADER_EXT, (uint64_t)shader, desc.debugName));
+  }
+  Result::setResult(outResult, Result());
+  return shader;
+}
+
+VkPipelineLayout lvk::VulkanContext::getShaderLayout(VkShaderEXT shader) const {
+  const std::unordered_map<VkShaderEXT, ShaderObjectState>::const_iterator it = shaderObjects_.find(shader);
+  return it != shaderObjects_.end() ? it->second.layout : VK_NULL_HANDLE;
+}
+
+bool lvk::VulkanContext::isShaderLayoutCompatible(VkShaderEXT shader) {
+  checkAndUpdateDescriptorSets();
+  const std::unordered_map<VkShaderEXT, ShaderObjectState>::const_iterator it = shaderObjects_.find(shader);
+  return it != shaderObjects_.end() && it->second.descriptorLayoutKey == DSets_[lastUpdatedDSet_].layoutCompatibilityKey;
+}
+
+void lvk::VulkanContext::destroyShader(VkShaderEXT shader) {
+  const std::unordered_map<VkShaderEXT, ShaderObjectState>::iterator it = shaderObjects_.find(shader);
+  if (it == shaderObjects_.end()) {
+    return;
+  }
+  deferredTask(std::packaged_task<void()>([device = vkDevice_, shader]() { vkDestroyShaderEXT(device, shader, nullptr); }));
+  shaderObjects_.erase(it);
+}
+
+lvk::ShaderState lvk::VulkanContext::createShaderFromSPIRV(const void* spirv, size_t numBytes,
+                                                       const char* debugName, Result* outResult) const {
+  (void)debugName;
+  if (!spirv || !numBytes || numBytes % sizeof(uint32_t)) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Expecting non-empty SPIR-V words");
+    return {};
+  }
+  ShaderState state;
+  state.storage = std::make_unique<ShaderState::Storage>();
+  state.storage->spirv.resize(numBytes / sizeof(uint32_t));
+  memcpy(state.storage->spirv.data(), spirv, numBytes);
+  SpvReflectShaderModule mdl = {};
+  if (spvReflectCreateShaderModule(numBytes, state.storage->spirv.data(), &mdl) != SPV_REFLECT_RESULT_SUCCESS) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Invalid SPIR-V code");
+    return {};
+  }
+  SCOPE_EXIT { spvReflectDestroyShaderModule(&mdl); };
+  if (mdl.entry_point_count != 1) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Expected exactly one SPIR-V entry point");
+    return {};
+  }
+  const VkShaderStageFlagBits stage = static_cast<VkShaderStageFlagBits>(mdl.shader_stage);
+  VkShaderStageFlags nextStage = 0;
+  switch (stage) {
+  case VK_SHADER_STAGE_VERTEX_BIT:
+    nextStage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    if (vkFeatures10_.features.tessellationShader) { nextStage |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; }
+    if (vkFeatures10_.features.geometryShader) { nextStage |= VK_SHADER_STAGE_GEOMETRY_BIT; }
+    break;
+  case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+    nextStage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    break;
+  case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+    nextStage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    if (vkFeatures10_.features.geometryShader) { nextStage |= VK_SHADER_STAGE_GEOMETRY_BIT; }
+    break;
+  case VK_SHADER_STAGE_GEOMETRY_BIT:
+  case VK_SHADER_STAGE_MESH_BIT_EXT:
+    nextStage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    break;
+  case VK_SHADER_STAGE_TASK_BIT_EXT:
+    nextStage = VK_SHADER_STAGE_MESH_BIT_EXT;
+    break;
+  case VK_SHADER_STAGE_FRAGMENT_BIT:
+  case VK_SHADER_STAGE_COMPUTE_BIT:
+    break;
+  default:
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Unsupported shader object stage");
+    return {};
+  }
+  for (uint32_t i = 0; i < mdl.push_constant_block_count; ++i) {
+    const SpvReflectBlockVariable& block = mdl.push_constant_blocks[i];
+    state.pushConstantsSize = std::max(state.pushConstantsSize, block.offset + block.size);
+  }
+  state.storage->entryPoint = mdl.entry_point_name;
+  state.ci = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+      .stage = stage,
+      .nextStage = nextStage,
+      .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+      .codeSize = numBytes,
+      .pCode = state.storage->spirv.data(),
+      .pName = state.storage->entryPoint.c_str(),
+  };
+  Result::setResult(outResult, Result());
+  return state;
+}
+
+lvk::ShaderState lvk::VulkanContext::createShaderFromGLSL(ShaderStage stage, const char* source,
+                                                      const char* debugName, Result* outResult) const {
+  const ShaderModuleState module = createShaderModuleFromGLSL(stage, source, debugName, outResult);
+  if (!module.ci.pCode) { return {}; }
+  SCOPE_EXIT { free((void*)module.ci.pCode); };
+  return createShaderFromSPIRV(module.ci.pCode, module.ci.codeSize, debugName, outResult);
+}
+
+lvk::ShaderState lvk::VulkanContext::createShaderFromSlang(ShaderStage stage, const char* source, const char* entryPointName,
+                                                       const char* debugName, Result* outResult) const {
+  const ShaderModuleState module = createShaderModuleFromSlang(stage, source, entryPointName, debugName, outResult);
+  if (!module.ci.pCode) { return {}; }
+  SCOPE_EXIT { free((void*)module.ci.pCode); };
+  return createShaderFromSPIRV(module.ci.pCode, module.ci.codeSize, debugName, outResult);
+}
+
+
 lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromSPIRV(const void* spirv,
                                                                        size_t numBytes,
                                                                        const char* debugName,
                                                                        Result* outResult) const {
   (void)debugName;
 
-  if (!spirv || !numBytes) {
+  if (!spirv || !numBytes || numBytes % sizeof(uint32_t)) {
     Result::setResult(outResult, Result(Result::Code::ArgumentOutOfRange, "Expecting non-empty SPIR-V code"));
     return {};
   }
 
   SpvReflectShaderModule mdl;
   SpvReflectResult result = spvReflectCreateShaderModule(numBytes, spirv, &mdl);
-  LVK_ASSERT(result == SPV_REFLECT_RESULT_SUCCESS);
+  if (result != SPV_REFLECT_RESULT_SUCCESS) {
+    Result::setResult(outResult, Result::Code::ArgumentOutOfRange, "Invalid SPIR-V code");
+    return {};
+  }
   SCOPE_EXIT {
     spvReflectDestroyShaderModule(&mdl);
   };
@@ -7020,7 +7371,12 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromSPIRV(const voi
       .pCode = (const uint32_t*)malloc(numBytes),
   };
 
+  if (!ci.pCode) {
+    Result::setResult(outResult, Result::Code::RuntimeError, "Failed to allocate SPIR-V code");
+    return {};
+  }
   memcpy((void*)ci.pCode, spirv, numBytes);
+  Result::setResult(outResult, Result());
 
   return {
       .ci = ci,
@@ -7160,7 +7516,11 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromGLSL(ShaderStag
   const glslang_resource_t glslangResource = lvk::getGlslangResource(getVkPhysicalDeviceProperties().limits);
 
   std::vector<uint8_t> spirv;
-  lvk::Result::setResult(outResult, lvk::compileShaderGlslang(stage, source, &spirv, &glslangResource));
+  const Result result = lvk::compileShaderGlslang(stage, source, &spirv, &glslangResource);
+  Result::setResult(outResult, result);
+  if (!result.isOk()) {
+    return {};
+  }
 
   return createShaderModuleFromSPIRV(spirv.data(), spirv.size(), debugName, outResult);
 }
@@ -7255,7 +7615,11 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromSlang(ShaderSta
   }
 
   std::vector<uint8_t> spirv;
-  lvk::Result::setResult(outResult, lvk::compileShaderSlang(pimpl_->slangGlobalSession_, stage, source, entryPointName, &spirv));
+  const Result result = lvk::compileShaderSlang(pimpl_->slangGlobalSession_, stage, source, entryPointName, &spirv);
+  Result::setResult(outResult, result);
+  if (!result.isOk()) {
+    return {};
+  }
 
   return createShaderModuleFromSPIRV(spirv.data(), spirv.size(), debugName, outResult);
 }
@@ -7536,6 +7900,7 @@ lvk::Result lvk::VulkanContext::createInstance() {
   const VkBool32 gpuav_descriptor_checks = VK_FALSE; // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/8688
   const VkBool32 gpuav_indirect_draws_buffers = VK_FALSE; // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/8579
   const VkBool32 gpuav_post_process_descriptor_indexing = VK_FALSE; // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/9222
+  const VkBool32 gpuav_validate_trace_ray = config_.enableGPUAVRayTracing ? VK_TRUE : VK_FALSE;
 #define LAYER_SETTINGS_BOOL32(name, var)                                                                                        \
   VkLayerSettingEXT {                                                                                                           \
     .pLayerName = kDefaultValidationLayers[0], .pSettingName = name, .type = VK_LAYER_SETTING_TYPE_BOOL32_EXT, .valueCount = 1, \
@@ -7545,6 +7910,7 @@ lvk::Result lvk::VulkanContext::createInstance() {
       LAYER_SETTINGS_BOOL32("gpuav_descriptor_checks", &gpuav_descriptor_checks),
       LAYER_SETTINGS_BOOL32("gpuav_indirect_draws_buffers", &gpuav_indirect_draws_buffers),
       LAYER_SETTINGS_BOOL32("gpuav_post_process_descriptor_indexing", &gpuav_post_process_descriptor_indexing),
+      LAYER_SETTINGS_BOOL32("gpuav_validate_trace_ray", &gpuav_validate_trace_ray),
       {"MoltenVK", "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", VK_LAYER_SETTING_TYPE_INT32_EXT, 1, &useMetalArgumentBuffers},
   };
 #undef LAYER_SETTINGS_BOOL32
@@ -8103,6 +8469,13 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
       .taskShader = VK_TRUE,
       .meshShader = VK_TRUE,
   };
+  VkPhysicalDeviceShaderObjectFeaturesEXT shaderObjectFeatures = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT,
+  };
+  if (hasExtension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME, allDeviceExtensions)) {
+    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &shaderObjectFeatures};
+    vkGetPhysicalDeviceFeatures2(vkPhysicalDevice_, &features);
+  }
   VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphicsPipelineLibraryFeatures = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
   };
@@ -8185,6 +8558,9 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   addOptionalExtension(VK_EXT_HDR_METADATA_EXTENSION_NAME, has_EXT_hdr_metadata_);
   addOptionalExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, has_EXT_device_fault_, &deviceFaultFeatures);
   addOptionalExtension(VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME, has_EXT_shader_tile_image, &shaderTileImageFeatures);
+  if (shaderObjectFeatures.shaderObject) {
+    addOptionalExtension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME, has_EXT_shader_object_, &shaderObjectFeatures);
+  }
   addOptionalExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME, has_EXT_mesh_shader_, &meshShaderFeatures);
   if (graphicsPipelineLibraryFeatures.graphicsPipelineLibrary) {
     addOptionalExtensions(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
@@ -8677,6 +9053,19 @@ lvk::Result lvk::VulkanContext::growDescriptorPool(VulkanContext::DescriptorSet&
       .pBindings = bindings,
   };
   VK_ASSERT(vkCreateDescriptorSetLayout(vkDevice_, &dslci, nullptr, &dset.vkDSL));
+  PipelineLibraryHash layoutHash;
+  layoutHash.add(dslci.flags, dslci.bindingCount);
+  for (uint32_t i = 0; i != dslci.bindingCount; ++i) {
+    const VkDescriptorSetLayoutBinding& binding = bindings[i];
+    layoutHash.add(binding.binding, binding.descriptorType, binding.descriptorCount, binding.stageFlags, bindingFlags[i]);
+    layoutHash.add(binding.pImmutableSamplers != nullptr);
+    if (binding.pImmutableSamplers) {
+      for (uint32_t j = 0; j != binding.descriptorCount; ++j) {
+        layoutHash.add((uint64_t)binding.pImmutableSamplers[j]);
+      }
+    }
+  }
+  dset.layoutCompatibilityKey = layoutHash.value;
   VK_ASSERT(lvk::setDebugObjectName(
       vkDevice_, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)dset.vkDSL, "Descriptor Set Layout: VulkanContext::vkDSL"));
 

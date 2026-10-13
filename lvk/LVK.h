@@ -14,6 +14,8 @@
 #include <memory>
 #include <utility>
 
+#include <volk.h>
+
 // clang-format off
 #if defined(LVK_WITH_MINILOG)
   #include <minilog/minilog.h>
@@ -801,6 +803,11 @@ struct SpecializationConstantDesc {
   }
 };
 
+struct ShaderDesc final : ShaderModuleDesc {
+  using ShaderModuleDesc::ShaderModuleDesc;
+  SpecializationConstantDesc specInfo = {};
+};
+
 struct RenderPipelineDesc final {
   Topology topology = Topology_Triangle;
 
@@ -1111,6 +1118,14 @@ class ICommandBuffer {
   virtual void cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle handle) = 0;
 
   virtual void cmdBindComputePipeline(lvk::ComputePipelineHandle handle) = 0;
+  // Native shader objects created by this context; null handles unbind the specified stages.
+  virtual void cmdBindShaderEXT(VkShaderStageFlagBits stage, VkShaderEXT shader) = 0;
+  // Baseline triangle rendering state, using the current framebuffer's samples and color targets.
+  // Shaders, vertex input, culling, depth and depth bias are set separately.
+  virtual void cmdSetShaderObjectDefaults() = 0;
+  virtual void cmdSetVertexInput(const VertexInput& input) = 0;
+  virtual void cmdSetCullMode(CullMode mode) = 0;
+  virtual void cmdBindShadersEXT(uint32_t stageCount, const VkShaderStageFlagBits* stages, const VkShaderEXT* shaders) = 0;
   virtual void cmdDispatchThreadGroups(const Dimensions& threadgroupCount, const Dependencies& deps = {}) = 0;
 
   virtual void cmdBeginRendering(const lvk::RenderPass& renderPass, const lvk::Framebuffer& desc, const Dependencies& deps = {}) = 0;
@@ -1332,6 +1347,7 @@ struct ContextConfig {
   bool terminateOnValidationError = false; // invoke std::terminate() on any validation error
   bool enableValidation = true;
   bool enableValidationBestPractices = false;
+  bool enableGPUAVRayTracing = true; // GPU-assisted ray tracing/ray query parameter checks
   lvk::ColorSpace swapchainRequestedColorSpace = lvk::ColorSpace_SRGB_NONLINEAR;
   // owned by the application - should be alive until createVulkanContextWithSwapchain() returns
   const void* pipelineCacheData = nullptr;

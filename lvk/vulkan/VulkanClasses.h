@@ -12,6 +12,7 @@
 
 #include <future>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -371,6 +372,24 @@ struct ShaderModuleState final {
   uint32_t pushConstantsSize = 0;
 };
 
+struct ShaderState final {
+  struct Storage {
+    std::vector<uint32_t> spirv;
+    std::string entryPoint;
+  };
+  // Keep ci pointers valid when the state is moved.
+  std::unique_ptr<Storage> storage;
+  VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT};
+  uint32_t pushConstantsSize = 0;
+};
+
+struct ShaderObjectState final {
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+  VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+  uint64_t descriptorLayoutKey = 0;
+};
+
 struct AccelerationStructure {
   bool isTLAS = false;
   VkAccelerationStructureBuildRangeInfoKHR buildRangeInfo = {};
@@ -398,6 +417,13 @@ class CommandBuffer final : public ICommandBuffer {
   void cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle handle) override;
 
   void cmdBindComputePipeline(lvk::ComputePipelineHandle handle) override;
+  // Native Vulkan shaders created by this context. Explicitly unbind unused graphics
+  // stages with VK_NULL_HANDLE; required graphics dynamic state must be set before drawing.
+  void cmdBindShaderEXT(VkShaderStageFlagBits stage, VkShaderEXT shader) override;
+  void cmdSetShaderObjectDefaults() override;
+  void cmdSetVertexInput(const VertexInput& input) override;
+  void cmdSetCullMode(CullMode mode) override;
+  void cmdBindShadersEXT(uint32_t stageCount, const VkShaderStageFlagBits* stages, const VkShaderEXT* shaders) override;
   void cmdDispatchThreadGroups(const Dimensions& threadgroupCount, const Dependencies& deps) override;
 
   void cmdPushDebugGroupLabel(const char* label, uint32_t colorRGBA) const override;
@@ -483,6 +509,8 @@ class CommandBuffer final : public ICommandBuffer {
   const VulkanImmediateCommands::CommandBufferWrapper* wrapper_ = nullptr;
 
   lvk::Framebuffer framebuffer_ = {};
+  VkViewport shaderViewport_ = {};
+  VkRect2D shaderScissor_ = {};
   lvk::SubmitHandle lastSubmitHandle_ = {};
 
   struct {
@@ -492,6 +520,7 @@ class CommandBuffer final : public ICommandBuffer {
   } inputAttachments_;
 
   VkPipeline lastPipelineBound_ = VK_NULL_HANDLE;
+  VkPipelineLayout currentShaderLayout_ = VK_NULL_HANDLE;
 
   bool isRendering_ = false;
   uint32_t viewMask_ = 0;
@@ -667,6 +696,12 @@ class VulkanContext final : public IContext {
 
   std::vector<uint8_t> getPipelineCacheData() const;
 
+  // Context-owned shader objects; specialization data is consumed synchronously.
+  VkShaderEXT createShader(const ShaderDesc& desc, Result* outResult = nullptr);
+  VkPipelineLayout getShaderLayout(VkShaderEXT shader) const;
+  bool isShaderLayoutCompatible(VkShaderEXT shader);
+  void destroyShader(VkShaderEXT shader);
+
   // Hash the layout definition, not the per-PSO VkPipelineLayout handle.
   static uint64_t get_pipeline_layout_key(const VkPipelineLayoutCreateInfo& ci);
   VkPipeline get_pipeline_library_vii(const VkGraphicsPipelineCreateInfo& ci);
@@ -686,6 +721,7 @@ class VulkanContext final : public IContext {
 
  private:
   struct DescriptorSet {
+    uint64_t layoutCompatibilityKey = 0;
     uint32_t maxTextures = 0;
     uint32_t maxSamplers = 0;
     uint32_t maxAccelStructs = 0;
@@ -706,6 +742,10 @@ class VulkanContext final : public IContext {
   void generateMipmap(TextureHandle handle) const;
   lvk::Result growDescriptorPool(VulkanContext::DescriptorSet& dset, uint32_t maxTextures, uint32_t maxSamplers, uint32_t maxAccelStructs);
   ShaderModuleState createShaderModuleFromSPIRV(const void* spirv, size_t numBytes, const char* debugName, Result* outResult) const;
+  ShaderState createShaderFromSPIRV(const void* spirv, size_t numBytes, const char* debugName, Result* outResult) const;
+  ShaderState createShaderFromGLSL(ShaderStage stage, const char* source, const char* debugName, Result* outResult) const;
+  ShaderState createShaderFromSlang(ShaderStage stage, const char* source, const char* entryPointName,
+                                  const char* debugName, Result* outResult) const;
   ShaderModuleState createShaderModuleFromGLSL(ShaderStage stage, const char* source, const char* debugName, Result* outResult) const;
   ShaderModuleState createShaderModuleFromSlang(ShaderStage stage,
                                                 const char* source,
@@ -725,6 +765,7 @@ class VulkanContext final : public IContext {
 
  private:
   friend class lvk::VulkanSwapchain;
+  friend class lvk::CommandBuffer;
   friend class lvk::VulkanStagingDevice;
 
   VkInstance vkInstance_ = VK_NULL_HANDLE;
@@ -823,6 +864,7 @@ class VulkanContext final : public IContext {
   bool has_EXT_shader_tile_image = false;
   bool has_EXT_mesh_shader_ = false;
   bool has_EXT_graphics_pipeline_library_ = false;
+  bool has_EXT_shader_object_ = false;
   bool has_MVK_macos_surface_ = false;
   bool has_KHR_shared_presentable_image_ = false;
   bool has_KHR_present_mode_fifo_latest_ready_ = false;
@@ -832,6 +874,7 @@ class VulkanContext final : public IContext {
   TextureHandle dummyTexture_;
 
   lvk::Pool<lvk::ShaderModule, lvk::ShaderModuleState> shaderModulesPool_;
+  std::unordered_map<VkShaderEXT, ShaderObjectState> shaderObjects_;
   lvk::Pool<lvk::RenderPipeline, lvk::RenderPipelineState> renderPipelinesPool_;
 
   std::unordered_map<uint64_t, VkPipeline> viiPool_;
