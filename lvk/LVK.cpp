@@ -50,16 +50,16 @@ void* createCocoaWindowView(void* window, void** outLayer);
 namespace {
 
 struct TextureFormatProperties {
-  const lvk::Format format = lvk::Format_Invalid;
-  const uint8_t bytesPerBlock : 5 = 1;
-  const uint8_t blockWidth : 3 = 1;
-  const uint8_t blockHeight : 3 = 1;
-  const uint8_t minBlocksX : 2 = 1;
-  const uint8_t minBlocksY : 2 = 1;
-  const bool depth : 1 = false;
-  const bool stencil : 1 = false;
-  const bool compressed : 1 = false;
-  const uint8_t numPlanes : 2 = 1;
+  const uint32_t format : 8 = lvk::Format_Invalid;
+  const uint32_t bytesPerBlock : 5 = 1;
+  const uint32_t blockWidth : 4 = 1;
+  const uint32_t blockHeight : 4 = 1;
+  const uint32_t minBlocksX : 2 = 1;
+  const uint32_t minBlocksY : 2 = 1;
+  const uint32_t depth : 1 = false;
+  const uint32_t stencil : 1 = false;
+  const uint32_t compressed : 1 = false;
+  const uint32_t numPlanes : 2 = 1;
 };
 
 // clang-format off
@@ -135,6 +135,8 @@ static constexpr TextureFormatProperties properties[] = {
     PROPS(ASTC_5x5_SRGBA, 16, .blockWidth = 5, .blockHeight = 5, .compressed = true),
     PROPS(ASTC_6x6_RGBA, 16, .blockWidth = 6, .blockHeight = 6, .compressed = true),
     PROPS(ASTC_6x6_SRGBA, 16, .blockWidth = 6, .blockHeight = 6, .compressed = true),
+    PROPS(ASTC_8x8_RGBA, 16, .blockWidth = 8, .blockHeight = 8, .compressed = true),
+    PROPS(ASTC_8x8_SRGBA, 16, .blockWidth = 8, .blockHeight = 8, .compressed = true),
     PROPS(Z_UN16, 2, .depth = true),
     PROPS(Z_UN24, 4, .depth = true), // implemented as `VK_FORMAT_D24_UNORM_S8_UINT`
     PROPS(Z_F32, 4, .depth = true),
@@ -335,6 +337,10 @@ void lvk::logShaderSource(const char* text) {
 }
 
 uint32_t lvk::VertexInput::getVertexSize() const {
+  if (inputBindings[0].stride) {
+    return inputBindings[0].stride;
+  }
+
   uint32_t vertexSize = 0;
   for (uint32_t i = 0; i < LVK_VERTEX_ATTRIBUTES_MAX && attributes[i].format != VertexFormat_Invalid; i++) {
     LVK_ASSERT_MSG(attributes[i].offset == vertexSize, "Unsupported vertex attributes format");

@@ -105,6 +105,42 @@
 
 #define LVK_ARRAY_NUM_ELEMENTS(x) (sizeof(x) / sizeof((x)[0]))
 
+#if !defined(LVK_DO_PRAGMA)
+#if defined(_MSC_VER)
+#define LVK_DO_PRAGMA(x) __pragma(x)
+#else
+#define LVK_DO_PRAGMA(x) _Pragma(#x)
+#endif
+#endif
+
+// Use around specific slow-to-debug functions in optimized builds, e.g.
+// PRAGMA_DISABLE_OPTIMIZATION
+// void someFunction() { ... }
+// PRAGMA_ENABLE_OPTIMIZATION
+#if defined(_MSC_VER)
+#define LVK_PRAGMA_DISABLE_OPTIMIZATION LVK_DO_PRAGMA(optimize("", off))
+#define LVK_PRAGMA_ENABLE_OPTIMIZATION LVK_DO_PRAGMA(optimize("", on))
+#elif defined(__clang__)
+#define LVK_PRAGMA_DISABLE_OPTIMIZATION LVK_DO_PRAGMA(clang optimize off)
+#define LVK_PRAGMA_ENABLE_OPTIMIZATION LVK_DO_PRAGMA(clang optimize on)
+#elif defined(__GNUC__)
+#define LVK_PRAGMA_DISABLE_OPTIMIZATION \
+  LVK_DO_PRAGMA(GCC push_options)       \
+  LVK_DO_PRAGMA(GCC optimize("O0"))
+#define LVK_PRAGMA_ENABLE_OPTIMIZATION LVK_DO_PRAGMA(GCC pop_options)
+#else
+#define LVK_PRAGMA_DISABLE_OPTIMIZATION
+#define LVK_PRAGMA_ENABLE_OPTIMIZATION
+#endif
+
+#if !defined(PRAGMA_DISABLE_OPTIMIZATION)
+#define PRAGMA_DISABLE_OPTIMIZATION LVK_PRAGMA_DISABLE_OPTIMIZATION
+#endif
+
+#if !defined(PRAGMA_ENABLE_OPTIMIZATION)
+#define PRAGMA_ENABLE_OPTIMIZATION LVK_PRAGMA_ENABLE_OPTIMIZATION
+#endif
+
 namespace lvk {
 
 class IContext;
@@ -368,6 +404,9 @@ struct Dimensions {
   inline Dimensions divide2D(uint32_t v) const {
     return {.width = width / v, .height = height / v, .depth = depth};
   }
+  inline Dimensions divide2DRoundUp(uint32_t v) const {
+    return {.width = (width + v - 1) / v, .height = (height + v - 1) / v, .depth = depth};
+  }
   inline Dimensions divide3D(uint32_t v) const {
     return {.width = width / v, .height = height / v, .depth = depth / v};
   }
@@ -544,6 +583,7 @@ enum VertexFormat : uint8_t {
   VertexFormat_HalfFloat4,
 
   VertexFormat_Int_2_10_10_10_REV,
+  VertexFormat_A2B10G10R10_SNorm = VertexFormat_Int_2_10_10_10_REV,
 };
 
 enum VertexInputRate : uint8_t {
@@ -628,6 +668,8 @@ enum Format : uint8_t {
   Format_ASTC_5x5_SRGBA, // requires `textureCompressionASTC_LDR`
   Format_ASTC_6x6_RGBA, // requires `textureCompressionASTC_LDR`
   Format_ASTC_6x6_SRGBA, // requires `textureCompressionASTC_LDR`
+  Format_ASTC_8x8_RGBA, // requires `textureCompressionASTC_LDR`
+  Format_ASTC_8x8_SRGBA, // requires `textureCompressionASTC_LDR`
 
   Format_Z_UN16,
   Format_Z_UN24,
@@ -1369,6 +1411,11 @@ class IContext {
 
   [[nodiscard]] virtual Holder<AccelStructHandle> createAccelerationStructure(const AccelStructDesc& desc, Result* outResult = nullptr) = 0;
 
+  virtual void createBLASBatch(const AccelStructDesc* descs,
+                               AccelStructHandle* outHandles,
+                               uint32_t count,
+                               Result* outResult = nullptr) = 0;
+
   virtual void destroy(ComputePipelineHandle handle) = 0;
   virtual void destroy(RenderPipelineHandle handle) = 0;
   virtual void destroy(RayTracingPipelineHandle) = 0;
@@ -1383,6 +1430,7 @@ class IContext {
   [[nodiscard]] virtual uint64_t gpuAddress(AccelStructHandle handle) const = 0;
 
 #pragma region Acceleration structure functions
+  [[nodiscard]] virtual uint64_t getAccelStructMemorySize(AccelStructHandle handle) const = 0;
   [[nodiscard]] virtual AccelStructSizes getAccelStructSizes(const AccelStructDesc& desc, Result* outResult = nullptr) const = 0;
 #pragma endregion
 
@@ -1483,6 +1531,7 @@ struct ContextConfig {
   VulkanVersion vulkanVersion = VulkanVersion_1_3;
   bool terminateOnValidationError = false; // invoke std::terminate() on any validation error
   bool enableValidation = true;
+  bool enableValidationBestPractices = false;
   bool enableValidationGpuAV = true;
   bool enableValidationSync = true;
   bool generateSPIRVDebugInfo = true;

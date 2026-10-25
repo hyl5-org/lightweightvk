@@ -2433,6 +2433,9 @@ void lvk::CommandBuffer::cmdTransitionToGeneral(const ldr::Span<TextureHandle>& 
   }
 
   for (TextureHandle handle : textures) {
+    if (handle.empty()) {
+      continue;
+    }
     LVK_ASSERT(!handle.empty());
     lvk::VulkanImage& tex = *ctx_->texturesPool_.get(handle);
 
@@ -2487,6 +2490,9 @@ void lvk::CommandBuffer::cmdTransitionToShaderReadOnly(const ldr::Span<TextureHa
   }
 
   for (TextureHandle handle : textures) {
+    if (handle.empty()) {
+      continue;
+    }
     lvk::VulkanImage& img = *ctx_->texturesPool_.get(handle);
 
     LVK_ASSERT(!img.isSwapchainImage_);
@@ -5698,105 +5704,312 @@ lvk::Holder<lvk::TextureHandle> lvk::VulkanContext::createTextureView(lvk::Textu
 }
 
 lvk::AccelStructHandle lvk::VulkanContext::createBLAS(const AccelStructDesc& desc, Result* outResult) {
-  VkAccelerationStructureGeometryKHR accelerationStructureGeometry{};
-  VkAccelerationStructureTrianglesOpacityMicromapKHR opacityMicromap{};
-  VkAccelerationStructureBuildSizesInfoKHR accelerationStructureBuildSizesInfo{};
-  getBuildInfoBLAS(desc, accelerationStructureGeometry, opacityMicromap, accelerationStructureBuildSizesInfo);
+  lvk::AccelStructHandle handle;
+  createBLASBatch(&desc, &handle, 1, outResult);
+  return handle;
+}
 
-  char debugNameBuffer[256] = {0};
-  if (desc.debugName) {
-    (void)snprintf(debugNameBuffer, sizeof(debugNameBuffer) - 1, "Buffer: %s", desc.debugName);
+void lvk::VulkanContext::createBLASBatch(const AccelStructDesc* descs, AccelStructHandle* outHandles, uint32_t count, Result* outResult) {
+  LVK_PROFILER_FUNCTION();
+
+  if (!count) {
+    Result::setResult(outResult, Result());
+    return;
   }
-  lvk::AccelerationStructure accelStruct = {
-      .buildFlags = buildFlagsToVkBuildAccelerationStructureFlags(desc.buildFlags),
-      .buildRangeInfo =
-          {
-              .primitiveCount = desc.buildRange.primitiveCount,
-              .primitiveOffset = desc.buildRange.primitiveOffset,
-              .firstVertex = desc.buildRange.firstVertex,
-              .transformOffset = desc.buildRange.transformOffset,
-          },
-      .buffer = createBuffer(
-          {
-              .usage = lvk::BufferUsageBits_AccelStructStorage,
-              .storage = lvk::StorageType_Device,
-              .size = accelerationStructureBuildSizesInfo.accelerationStructureSize,
-              .debugName = debugNameBuffer,
-          },
-          nullptr,
-          outResult),
-      .geometry = accelerationStructureGeometry,
-      .opacityMicromap = opacityMicromap,
-  };
-  // must not point to the stack; cmdUpdateBLAS() re-links it
-  accelStruct.geometry.geometry.triangles.pNext = nullptr;
 
-  if (has_KHR_device_address_commands_) {
-    // vkCreateAccelerationStructureKHR() is a legacy command when VK_KHR_device_address_commands is enabled
-    const lvk::VulkanBuffer* buf = buffersPool_.get(accelStruct.buffer);
-    const VkAccelerationStructureCreateInfo2KHR ciAccelerationStructure = {
-        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_2_KHR,
-        .addressRange = {.address = buf->vkDeviceAddress_, .size = accelerationStructureBuildSizesInfo.accelerationStructureSize},
-        .addressFlags = buf->getVkAddressCommandFlags(),
-        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-    };
-    VK_ASSERT(vkCreateAccelerationStructure2KHR(vkDevice_, &ciAccelerationStructure, nullptr, &accelStruct.vkHandle));
-  } else {
-    const VkAccelerationStructureCreateInfoKHR ciAccelerationStructure = {
+  if (!LVK_VERIFY(has_KHR_acceleration_structure_)) {
+    Result::setResult(outResult, Result(Result::Code::RuntimeError, "VK_KHR_acceleration_structure is not enabled"));
+    return;
+  }
+
+  const auto createBlasHandle = [this](lvk::BufferHandle buffer, VkDeviceSize size, VkAccelerationStructureKHR* handle) {
+    const lvk::VulkanBuffer* storage = buffersPool_.get(buffer);
+    if (has_KHR_device_address_commands_) {
+      const VkAccelerationStructureCreateInfo2KHR info = {
+          .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_2_KHR,
+          .addressRange = {.address = storage->vkDeviceAddress_, .size = size},
+          .addressFlags = storage->getVkAddressCommandFlags(),
+          .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+      };
+      return vkCreateAccelerationStructure2KHR(vkDevice_, &info, nullptr, handle);
+    }
+    const VkAccelerationStructureCreateInfoKHR info = {
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
-        .buffer = getVkBuffer(this, accelStruct.buffer),
-        .size = accelerationStructureBuildSizesInfo.accelerationStructureSize,
+        .buffer = storage->vkBuffer_,
+        .size = size,
         .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
     };
-    VK_ASSERT(vkCreateAccelerationStructureKHR(vkDevice_, &ciAccelerationStructure, nullptr, &accelStruct.vkHandle));
-  }
+    return vkCreateAccelerationStructureKHR(vkDevice_, &info, nullptr, handle);
+  };
 
-  if (!LVK_VERIFY(accelStruct.vkHandle)) {
-    Result::setResult(outResult, Result::Code::RuntimeError, "Cannot create VkAccelerationStructureKHR");
-    return {};
+  const uint32_t alignment = accelerationStructureProperties_.minAccelerationStructureScratchOffsetAlignment;
+
+  struct BLASBuildEntry {
+    VkAccelerationStructureGeometryKHR geometry = {};
+    VkAccelerationStructureTrianglesOpacityMicromapKHR opacityMicromap = {};
+    VkAccelerationStructureBuildSizesInfoKHR sizesInfo = {};
+    lvk::AccelerationStructure accelStruct = {};
+    bool allowCompaction = false;
+  };
+
+  std::vector<BLASBuildEntry> entries(count);
+  uint64_t maxScratchSize = 0;
+
+  for (uint32_t i = 0; i < count; i++) {
+    LVK_ASSERT(descs[i].type == AccelStructType_BLAS);
+    outHandles[i] = {};
+
+    getBuildInfoBLAS(descs[i], entries[i].geometry, entries[i].opacityMicromap, entries[i].sizesInfo);
+    entries[i].accelStruct.buildFlags = buildFlagsToVkBuildAccelerationStructureFlags(descs[i].buildFlags);
+    entries[i].accelStruct.geometry = entries[i].geometry;
+    entries[i].accelStruct.geometry.geometry.triangles.pNext = nullptr;
+    entries[i].accelStruct.opacityMicromap = entries[i].opacityMicromap;
+    entries[i].allowCompaction = (descs[i].buildFlags & AccelStructBuildFlagBits_AllowCompaction) != 0;
+
+    if (entries[i].sizesInfo.buildScratchSize > maxScratchSize) {
+      maxScratchSize = entries[i].sizesInfo.buildScratchSize;
+    }
+
+    char debugNameBuffer[256] = {0};
+    if (descs[i].debugName) {
+      snprintf(debugNameBuffer, sizeof(debugNameBuffer) - 1, "Buffer: %s", descs[i].debugName);
+    }
+    entries[i].accelStruct.buildRangeInfo = {
+        .primitiveCount = descs[i].buildRange.primitiveCount,
+        .primitiveOffset = descs[i].buildRange.primitiveOffset,
+        .firstVertex = descs[i].buildRange.firstVertex,
+        .transformOffset = descs[i].buildRange.transformOffset,
+    };
+    entries[i].accelStruct.buffer = createBuffer(
+        {
+            .usage = lvk::BufferUsageBits_AccelStructStorage,
+            .storage = lvk::StorageType_Device,
+            .size = entries[i].sizesInfo.accelerationStructureSize,
+            .debugName = debugNameBuffer,
+        },
+        nullptr,
+        outResult);
+
+    VK_ASSERT(
+        createBlasHandle(entries[i].accelStruct.buffer, entries[i].sizesInfo.accelerationStructureSize, &entries[i].accelStruct.vkHandle));
   }
 
   lvk::Holder<lvk::BufferHandle> scratchBuffer = createBuffer(
       {
           .usage = lvk::BufferUsageBits_Storage,
           .storage = lvk::StorageType_Device,
-          .size = std::max(accelerationStructureBuildSizesInfo.buildScratchSize,
-                           accelerationStructureBuildSizesInfo.updateScratchSize),
-          .debugName = "Buffer: BLAS scratch",
+          .size = maxScratchSize + alignment - 1,
+          .debugName = "Buffer: BLAS batch scratch",
       },
       nullptr,
       outResult);
 
-  const VkAccelerationStructureBuildGeometryInfoKHR accelerationBuildGeometryInfo{
-      .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-      .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-      .flags = buildFlagsToVkBuildAccelerationStructureFlags(desc.buildFlags),
-      .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
-      .dstAccelerationStructure = accelStruct.vkHandle,
-      .geometryCount = 1,
-      .pGeometries = &accelerationStructureGeometry,
-      .scratchData = {.deviceAddress = getAlignedAddress(gpuAddress(scratchBuffer),
-                                                         accelerationStructureProperties_.minAccelerationStructureScratchOffsetAlignment)},
-  };
+  const uint64_t scratchAddress = getAlignedAddress(gpuAddress(scratchBuffer), alignment);
 
-  const VkAccelerationStructureBuildRangeInfoKHR* accelerationBuildStructureRangeInfos[] = {&accelStruct.buildRangeInfo};
+  // Build all BLAS in one command buffer
+  {
+    lvk::ICommandBuffer& cmdBuf = acquireCommandBuffer();
+    const VkCommandBuffer vkCmdBuf = lvk::getVkCommandBuffer(cmdBuf);
 
-  lvk::ICommandBuffer& buffer = acquireCommandBuffer();
-  vkCmdBuildAccelerationStructuresKHR(
-      lvk::getVkCommandBuffer(buffer), 1, &accelerationBuildGeometryInfo, accelerationBuildStructureRangeInfos);
-  wait(submit(buffer, {}, {}));
+    for (uint32_t i = 0; i < count; i++) {
+      if (i > 0) {
+        // Barrier between builds: scratch buffer WAW hazard
+        const VkMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+            .dstStageMask = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        };
+        const VkDependencyInfo depInfo = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(vkCmdBuf, &depInfo);
+      }
 
-  const VkAccelerationStructureDeviceAddressInfoKHR accelerationDeviceAddressInfo{
-      .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
-      .accelerationStructure = accelStruct.vkHandle,
-  };
-  accelStruct.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vkDevice_, &accelerationDeviceAddressInfo);
+      const VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {
+          .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+          .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+          .flags = buildFlagsToVkBuildAccelerationStructureFlags(descs[i].buildFlags),
+          .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+          .dstAccelerationStructure = entries[i].accelStruct.vkHandle,
+          .geometryCount = 1,
+          .pGeometries = &entries[i].geometry,
+          .scratchData = {.deviceAddress = scratchAddress},
+      };
 
-  if (desc.buildFlags & lvk::AccelStructBuildFlagBits_AllowUpdate) {
-    accelStruct.scratchBuffer = std::move(scratchBuffer);
+      const VkAccelerationStructureBuildRangeInfoKHR* rangeInfos[] = {&entries[i].accelStruct.buildRangeInfo};
+      vkCmdBuildAccelerationStructuresKHR(vkCmdBuf, 1, &buildInfo, rangeInfos);
+    }
+
+    const VkMemoryBarrier2 ready = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+    };
+    const VkDependencyInfo dependency = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &ready,
+    };
+    vkCmdPipelineBarrier2(vkCmdBuf, &dependency);
+    wait(submit(cmdBuf, {}, {}));
   }
 
-  return accelStructuresPool_.create(std::move(accelStruct));
+  // Batch compaction
+  uint32_t numCompactable = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    if (entries[i].allowCompaction) {
+      numCompactable++;
+    }
+  }
+
+  if (numCompactable > 0) {
+    VkQueryPool compactionQueryPool = VK_NULL_HANDLE;
+    const VkQueryPoolCreateInfo qpCI = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+        .queryCount = numCompactable,
+    };
+    VK_ASSERT(vkCreateQueryPool(vkDevice_, &qpCI, nullptr, &compactionQueryPool));
+
+    // Query compacted sizes
+    {
+      lvk::ICommandBuffer& cmdBuf = acquireCommandBuffer();
+      const VkCommandBuffer vkCmdBuf = lvk::getVkCommandBuffer(cmdBuf);
+      vkCmdResetQueryPool(vkCmdBuf, compactionQueryPool, 0, numCompactable);
+
+      uint32_t queryIndex = 0;
+      for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].allowCompaction) {
+          vkCmdWriteAccelerationStructuresPropertiesKHR(vkCmdBuf,
+                                                        1,
+                                                        &entries[i].accelStruct.vkHandle,
+                                                        VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                                                        compactionQueryPool,
+                                                        queryIndex++);
+        }
+      }
+      wait(submit(cmdBuf, {}, {}));
+    }
+
+    std::vector<VkDeviceSize> compactedSizes(numCompactable);
+    VK_ASSERT(vkGetQueryPoolResults(vkDevice_,
+                                    compactionQueryPool,
+                                    0,
+                                    numCompactable,
+                                    sizeof(VkDeviceSize) * numCompactable,
+                                    compactedSizes.data(),
+                                    sizeof(VkDeviceSize),
+                                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT));
+
+    // Compact eligible BLAS
+    {
+      std::vector<lvk::AccelerationStructure> pendingDestroy;
+      pendingDestroy.reserve(numCompactable);
+      lvk::ICommandBuffer& cmdBuf = acquireCommandBuffer();
+      const VkCommandBuffer vkCmdBuf = lvk::getVkCommandBuffer(cmdBuf);
+
+      uint32_t queryIndex = 0;
+      for (uint32_t i = 0; i < count; i++) {
+        if (!entries[i].allowCompaction) {
+          continue;
+        }
+        const VkDeviceSize compactedSize = compactedSizes[queryIndex++];
+        const VkDeviceSize originalSize = entries[i].sizesInfo.accelerationStructureSize;
+        const bool sizeIsSane = compactedSize >= 4096 && compactedSize * 32 >= originalSize;
+
+        if (compactedSize > 0 && compactedSize < originalSize && sizeIsSane) {
+          char compactedDebugName[256] = {0};
+          if (descs[i].debugName) {
+            snprintf(compactedDebugName, sizeof(compactedDebugName) - 1, "Buffer: %s compacted", descs[i].debugName);
+          }
+          lvk::AccelerationStructure compactedAS = {
+              .buildFlags = entries[i].accelStruct.buildFlags,
+              .buildRangeInfo = entries[i].accelStruct.buildRangeInfo,
+              .buffer = createBuffer(
+                  {
+                      .usage = lvk::BufferUsageBits_AccelStructStorage,
+                      .storage = lvk::StorageType_Device,
+                      .size = compactedSize,
+                      .debugName = compactedDebugName,
+                  },
+                  nullptr,
+                  outResult),
+          };
+          VK_ASSERT(createBlasHandle(compactedAS.buffer, compactedSize, &compactedAS.vkHandle));
+
+          const VkCopyAccelerationStructureInfoKHR copyInfo = {
+              .sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR,
+              .src = entries[i].accelStruct.vkHandle,
+              .dst = compactedAS.vkHandle,
+              .mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR,
+          };
+          vkCmdCopyAccelerationStructureKHR(vkCmdBuf, &copyInfo);
+          compactedAS.geometry = entries[i].accelStruct.geometry;
+          compactedAS.opacityMicromap = entries[i].accelStruct.opacityMicromap;
+          pendingDestroy.push_back(std::move(entries[i].accelStruct));
+          entries[i].accelStruct = std::move(compactedAS);
+        }
+      }
+
+      const VkMemoryBarrier2 ready = {
+          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+          .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+          .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+          .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+          .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+      };
+      const VkDependencyInfo dependency = {
+          .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+          .memoryBarrierCount = 1,
+          .pMemoryBarriers = &ready,
+      };
+      vkCmdPipelineBarrier2(vkCmdBuf, &dependency);
+      wait(submit(cmdBuf, {}, {}));
+
+      for (const lvk::AccelerationStructure& source : pendingDestroy) {
+        vkDestroyAccelerationStructureKHR(vkDevice_, source.vkHandle, nullptr);
+      }
+    }
+
+    vkDestroyQueryPool(vkDevice_, compactionQueryPool, nullptr);
+  }
+
+  // Get device addresses and register in pool
+  for (uint32_t i = 0; i < count; i++) {
+    const VkAccelerationStructureDeviceAddressInfoKHR addrInfo = {
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+        .accelerationStructure = entries[i].accelStruct.vkHandle,
+    };
+    entries[i].accelStruct.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vkDevice_, &addrInfo);
+    if (descs[i].buildFlags & lvk::AccelStructBuildFlagBits_AllowUpdate) {
+      entries[i].accelStruct.scratchBuffer = createBuffer({.usage = lvk::BufferUsageBits_Storage,
+                                                           .storage = lvk::StorageType_Device,
+                                                           .size = entries[i].sizesInfo.updateScratchSize + alignment - 1,
+                                                           .debugName = "Buffer: BLAS update scratch"},
+                                                          nullptr,
+                                                          outResult);
+    }
+    outHandles[i] = accelStructuresPool_.create(std::move(entries[i].accelStruct));
+  }
+
+  awaitingCreation_ = true;
+  Result::setResult(outResult, Result());
+}
+
+uint64_t lvk::VulkanContext::getAccelStructMemorySize(AccelStructHandle handle) const {
+  const lvk::AccelerationStructure* as = accelStructuresPool_.get(handle);
+  LVK_ASSERT(as);
+  const VulkanBuffer* buffer = as ? buffersPool_.get(as->buffer) : nullptr;
+  LVK_ASSERT(buffer);
+  return buffer ? uint64_t(buffer->bufferSize_) : 0u;
 }
 
 lvk::AccelStructHandle lvk::VulkanContext::createOpacityMicromap(const AccelStructDesc& desc, Result* outResult) {
@@ -7838,6 +8051,7 @@ lvk::Result lvk::VulkanContext::createInstance() {
 
   const VkBool32 gpuav_enable = enableGpuAV ? VK_TRUE : VK_FALSE;
   const VkBool32 gpuav_post_process_descriptor_indexing = VK_FALSE; // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/9222
+  const VkBool32 bestPractices_enable = config_.enableValidation && config_.enableValidationBestPractices ? VK_TRUE : VK_FALSE;
   const VkBool32 syncval_enable = config_.enableValidation && config_.enableValidationSync ? VK_TRUE : VK_FALSE;
   const VkBool32 legacy_detection = config_.enableValidation ? VK_TRUE : VK_FALSE;
   const char* legacy_detection_mode = "ONLY_ENABLED";
@@ -7857,6 +8071,7 @@ lvk::Result lvk::VulkanContext::createInstance() {
   const VkLayerSettingEXT settings[] = {
       LAYER_SETTINGS_BOOL32("gpuav_enable", &gpuav_enable),
       LAYER_SETTINGS_BOOL32("gpuav_post_process_descriptor_indexing", &gpuav_post_process_descriptor_indexing),
+      LAYER_SETTINGS_BOOL32("validate_best_practices", &bestPractices_enable),
       LAYER_SETTINGS_BOOL32("validate_sync", &syncval_enable),
       LAYER_SETTINGS_BOOL32("syncval_submit_time_validation", &syncval_enable),
       LAYER_SETTINGS_BOOL32("legacy_detection", &legacy_detection),

@@ -270,7 +270,8 @@ struct RenderPipelineState final {
   VkVertexInputBindingDescription vkBindings_[VertexInput::LVK_VERTEX_BUFFER_MAX] = {};
   VkVertexInputAttributeDescription vkAttributes_[VertexInput::LVK_VERTEX_ATTRIBUTES_MAX] = {};
 
-  // non-owning, the last seen VkDescriptorSetLayout from VulkanContext::vkDSL_ (if the context has a new layout, invalidate all VkPipelines)
+  // non-owning, the last seen VkDescriptorSetLayout from VulkanContext::vkDSL_ (if the context has a new layout, invalidate all
+  // VkPipelines)
   VkDescriptorSetLayout lastVkDescriptorSetLayout_ = VK_NULL_HANDLE;
 
   VkShaderStageFlags shaderStageFlags_ = 0;
@@ -635,6 +636,8 @@ class VulkanContext final : public IContext {
 
   Holder<AccelStructHandle> createAccelerationStructure(const AccelStructDesc& desc, Result* outResult) override;
 
+  void createBLASBatch(const AccelStructDesc* descs, AccelStructHandle* outHandles, uint32_t count, Result* outResult) override;
+
   void destroy(ComputePipelineHandle handle) override;
   void destroy(RenderPipelineHandle handle) override;
   void destroy(RayTracingPipelineHandle handle) override;
@@ -647,6 +650,7 @@ class VulkanContext final : public IContext {
   void destroy(Framebuffer& fb) override;
 
   uint64_t gpuAddress(AccelStructHandle handle) const override;
+  uint64_t getAccelStructMemorySize(AccelStructHandle handle) const override;
 
   Result upload(BufferHandle handle, const void* data, size_t size, size_t offset) override;
   Result download(BufferHandle handle, void* data, size_t size, size_t offset) override;
